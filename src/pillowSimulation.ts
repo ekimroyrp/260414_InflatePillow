@@ -91,9 +91,42 @@ const DEFAULT_PARAMS: SimulationParams = {
 }
 
 const MIDPLANE_EPSILON = 0.0025
+const FOIL_MATERIAL_STYLE = {
+  color: 0xf1f5ff,
+  metalness: 1,
+  roughness: 0.28,
+  clearcoat: 1,
+  clearcoatRoughness: 0.24,
+  envMapIntensity: 1.9,
+  iridescence: 0.72,
+  iridescenceIOR: 1.22,
+  iridescenceThicknessRange: [140, 460] as [number, number],
+  reflectivity: 1,
+  specularIntensity: 1,
+  sheen: 0.1,
+  sheenRoughness: 0.5,
+  sheenColor: 0xe7eeff,
+}
+
+const MATTE_MATERIAL_STYLE = {
+  color: 0xc2d5f2,
+  metalness: 0.04,
+  roughness: 0.86,
+  clearcoat: 0,
+  clearcoatRoughness: 0,
+  envMapIntensity: 0,
+  iridescence: 0,
+  iridescenceIOR: 1.22,
+  iridescenceThicknessRange: [140, 460] as [number, number],
+  reflectivity: 0.18,
+  specularIntensity: 0.22,
+  sheen: 0,
+  sheenRoughness: 1,
+  sheenColor: 0xffffff,
+}
 
 export class PillowSimulation {
-  readonly mesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>
+  readonly mesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshPhysicalMaterial>
   readonly state: PillowSimulationState
 
   private readonly wireOverlay: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>
@@ -175,10 +208,21 @@ export class PillowSimulation {
 
     this.mesh = new THREE.Mesh(
       geometry,
-      new THREE.MeshStandardMaterial({
-        color: 0xc2d5f2,
-        roughness: 0.86,
-        metalness: 0.04,
+      new THREE.MeshPhysicalMaterial({
+        color: FOIL_MATERIAL_STYLE.color,
+        metalness: FOIL_MATERIAL_STYLE.metalness,
+        roughness: FOIL_MATERIAL_STYLE.roughness,
+        clearcoat: FOIL_MATERIAL_STYLE.clearcoat,
+        clearcoatRoughness: FOIL_MATERIAL_STYLE.clearcoatRoughness,
+        envMapIntensity: FOIL_MATERIAL_STYLE.envMapIntensity,
+        iridescence: FOIL_MATERIAL_STYLE.iridescence,
+        iridescenceIOR: FOIL_MATERIAL_STYLE.iridescenceIOR,
+        iridescenceThicknessRange: FOIL_MATERIAL_STYLE.iridescenceThicknessRange,
+        reflectivity: FOIL_MATERIAL_STYLE.reflectivity,
+        specularIntensity: FOIL_MATERIAL_STYLE.specularIntensity,
+        sheen: FOIL_MATERIAL_STYLE.sheen,
+        sheenRoughness: FOIL_MATERIAL_STYLE.sheenRoughness,
+        sheenColor: new THREE.Color(FOIL_MATERIAL_STYLE.sheenColor),
       }),
     )
     this.wireOverlay = new THREE.Mesh(
@@ -291,10 +335,32 @@ export class PillowSimulation {
     this.wireOverlay.visible = visible
   }
 
+  setReflectionEnabled(enabled: boolean): void {
+    this.applyMaterialStyle(enabled ? FOIL_MATERIAL_STYLE : MATTE_MATERIAL_STYLE)
+  }
+
   dispose(): void {
     this.mesh.geometry.dispose()
     this.mesh.material.dispose()
     this.wireOverlay.material.dispose()
+  }
+
+  private applyMaterialStyle(style: typeof FOIL_MATERIAL_STYLE): void {
+    this.mesh.material.color.setHex(style.color)
+    this.mesh.material.metalness = style.metalness
+    this.mesh.material.roughness = style.roughness
+    this.mesh.material.clearcoat = style.clearcoat
+    this.mesh.material.clearcoatRoughness = style.clearcoatRoughness
+    this.mesh.material.envMapIntensity = style.envMapIntensity
+    this.mesh.material.iridescence = style.iridescence
+    this.mesh.material.iridescenceIOR = style.iridescenceIOR
+    this.mesh.material.iridescenceThicknessRange = [...style.iridescenceThicknessRange]
+    this.mesh.material.reflectivity = style.reflectivity
+    this.mesh.material.specularIntensity = style.specularIntensity
+    this.mesh.material.sheen = style.sheen
+    this.mesh.material.sheenRoughness = style.sheenRoughness
+    this.mesh.material.sheenColor.setHex(style.sheenColor)
+    this.mesh.material.needsUpdate = true
   }
 
   private step(deltaTime: number): void {
@@ -790,7 +856,7 @@ function buildContourWeights(flatMesh: FlatMeshData): { weights: number[]; maxDi
   }
 
   const smoothedMax = Math.max(...smoothedWeights, 0.001)
-  const weights = smoothedWeights.map((weight, index) => {
+  let weights = smoothedWeights.map((weight, index) => {
     if (flatMesh.stitchedVertexIndices.has(index)) {
       return 0
     }
@@ -798,6 +864,38 @@ function buildContourWeights(flatMesh: FlatMeshData): { weights: number[]; maxDi
     const normalized = THREE.MathUtils.clamp(weight / smoothedMax, 0, 1)
     return applyInflationRamp(normalized)
   })
+
+  for (let iteration = 0; iteration < 4; iteration += 1) {
+    const nextWeights = weights.slice()
+
+    for (let index = 0; index < weights.length; index += 1) {
+      if (flatMesh.stitchedVertexIndices.has(index)) {
+        continue
+      }
+
+      const neighbors = adjacency[index]
+      if (neighbors.length === 0) {
+        continue
+      }
+
+      const seamBlend = 1 - THREE.MathUtils.smoothstep(normalizedDistances[index], 0.08, 0.28)
+      if (seamBlend <= 0) {
+        continue
+      }
+
+      const neighborAverage =
+        neighbors.reduce((sum, neighborIndex) => sum + weights[neighborIndex], 0) /
+        neighbors.length
+
+      nextWeights[index] = THREE.MathUtils.lerp(
+        weights[index],
+        neighborAverage,
+        seamBlend * 0.24,
+      )
+    }
+
+    weights = nextWeights
+  }
 
   return { weights, maxDistance }
 }

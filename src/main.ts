@@ -123,6 +123,10 @@ app.innerHTML = `
               <span>Mesh Wires</span>
               <input id="wireToggle" type="checkbox" checked />
             </label>
+            <label class="toggle-control" for="reflectionToggle">
+              <span>Foil Material</span>
+              <input id="reflectionToggle" type="checkbox" checked />
+            </label>
             <p id="statusText" class="status-text"></p>
           </div>
         </section>
@@ -142,6 +146,88 @@ function requireElement<T extends Element>(selector: string): T {
   return element
 }
 
+function addWrappedGlow(
+  context: CanvasRenderingContext2D,
+  width: number,
+  x: number,
+  y: number,
+  radius: number,
+  stops: readonly [number, string][],
+): void {
+  for (const offset of [-width, 0, width]) {
+    const gradient = context.createRadialGradient(x + offset, y, 0, x + offset, y, radius)
+    for (const [position, color] of stops) {
+      gradient.addColorStop(position, color)
+    }
+
+    context.fillStyle = gradient
+    context.fillRect(x + offset - radius, y - radius, radius * 2, radius * 2)
+  }
+}
+
+function createStudioReflectionEnvironment(renderer: THREE.WebGLRenderer): THREE.WebGLRenderTarget {
+  const pmremGenerator = new THREE.PMREMGenerator(renderer)
+  const canvas = document.createElement('canvas')
+  canvas.width = 1024
+  canvas.height = 512
+
+  const context = canvas.getContext('2d')
+  if (!context) {
+    throw new Error('Could not create environment canvas context.')
+  }
+
+  const width = canvas.width
+  const height = canvas.height
+  const baseGradient = context.createLinearGradient(0, 0, 0, height)
+  baseGradient.addColorStop(0, '#172241')
+  baseGradient.addColorStop(0.24, '#35538b')
+  baseGradient.addColorStop(0.52, '#9aa8e2')
+  baseGradient.addColorStop(0.76, '#ebf1ff')
+  baseGradient.addColorStop(1, '#c8f3ff')
+  context.fillStyle = baseGradient
+  context.fillRect(0, 0, width, height)
+
+  addWrappedGlow(context, width, width * 0.18, height * 0.5, width * 0.24, [
+    [0, 'rgba(255, 92, 223, 0.62)'],
+    [0.42, 'rgba(255, 92, 223, 0.18)'],
+    [1, 'rgba(255, 92, 223, 0)'],
+  ])
+
+  addWrappedGlow(context, width, width * 0.82, height * 0.52, width * 0.24, [
+    [0, 'rgba(255, 207, 103, 0.82)'],
+    [0.4, 'rgba(255, 207, 103, 0.24)'],
+    [1, 'rgba(255, 207, 103, 0)'],
+  ])
+
+  addWrappedGlow(context, width, width * 0.5, height * 0.84, width * 0.34, [
+    [0, 'rgba(79, 230, 255, 0.72)'],
+    [0.38, 'rgba(79, 230, 255, 0.24)'],
+    [1, 'rgba(79, 230, 255, 0)'],
+  ])
+
+  addWrappedGlow(context, width, width * 0.5, height * 0.2, width * 0.26, [
+    [0, 'rgba(255, 255, 255, 0.82)'],
+    [0.48, 'rgba(255, 255, 255, 0.18)'],
+    [1, 'rgba(255, 255, 255, 0)'],
+  ])
+
+  addWrappedGlow(context, width, width * 0.58, height * 0.58, width * 0.18, [
+    [0, 'rgba(255, 255, 255, 0.34)'],
+    [0.55, 'rgba(255, 255, 255, 0.08)'],
+    [1, 'rgba(255, 255, 255, 0)'],
+  ])
+
+  const environmentTexture = new THREE.CanvasTexture(canvas)
+  environmentTexture.colorSpace = THREE.SRGBColorSpace
+  environmentTexture.mapping = THREE.EquirectangularReflectionMapping
+
+  const environmentTarget = pmremGenerator.fromEquirectangular(environmentTexture)
+  environmentTexture.dispose()
+  pmremGenerator.dispose()
+
+  return environmentTarget
+}
+
 const canvas = requireElement<HTMLCanvasElement>('.viewport')
 const uiPanel = requireElement<HTMLDivElement>('#ui-panel')
 const uiHandleTop = requireElement<HTMLDivElement>('#ui-handle')
@@ -157,6 +243,7 @@ const innerSeamCurvatureValue = requireElement<HTMLSpanElement>('#inner-seam-cur
 const pressureSlider = requireElement<HTMLInputElement>('#pressureSlider')
 const pressureValue = requireElement<HTMLSpanElement>('#pressure-value')
 const wireToggle = requireElement<HTMLInputElement>('#wireToggle')
+const reflectionToggle = requireElement<HTMLInputElement>('#reflectionToggle')
 const statusText = requireElement<HTMLParagraphElement>('#statusText')
 
 const renderer = new THREE.WebGLRenderer({
@@ -165,11 +252,20 @@ const renderer = new THREE.WebGLRenderer({
   powerPreference: 'high-performance',
 })
 renderer.outputColorSpace = THREE.SRGBColorSpace
+renderer.toneMapping = THREE.ACESFilmicToneMapping
+renderer.toneMappingExposure = 1.18
 renderer.shadowMap.enabled = true
 renderer.shadowMap.type = THREE.PCFSoftShadowMap
 
 const scene = new THREE.Scene()
-scene.background = new THREE.Color(0xe6edf3)
+scene.background = new THREE.Color(0xe8edf8)
+const reflectionEnvironment = createStudioReflectionEnvironment(renderer)
+scene.environment = reflectionEnvironment.texture
+const REFLECTION_ACCENT_INTENSITIES = {
+  magenta: 6.2,
+  cyan: 7.8,
+  amber: 6.9,
+} as const
 
 const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 200)
 camera.position.set(8.5, 7.2, 8.5)
@@ -205,6 +301,33 @@ scene.add(keyLight)
 const fillLight = new THREE.DirectionalLight(0xd7ebff, 0.55)
 fillLight.position.set(-9, 6, -8)
 scene.add(fillLight)
+
+const magentaAccentLight = new THREE.PointLight(
+  0xff4cc8,
+  REFLECTION_ACCENT_INTENSITIES.magenta,
+  30,
+  2,
+)
+magentaAccentLight.position.set(-7.5, 4.5, 4.8)
+scene.add(magentaAccentLight)
+
+const cyanAccentLight = new THREE.PointLight(
+  0x4fe6ff,
+  REFLECTION_ACCENT_INTENSITIES.cyan,
+  28,
+  2,
+)
+cyanAccentLight.position.set(6.5, 2.4, 7.5)
+scene.add(cyanAccentLight)
+
+const amberAccentLight = new THREE.PointLight(
+  0xffc857,
+  REFLECTION_ACCENT_INTENSITIES.amber,
+  28,
+  2,
+)
+amberAccentLight.position.set(7.8, 5.2, -4.8)
+scene.add(amberAccentLight)
 
 const ground = new THREE.Mesh(
   new THREE.PlaneGeometry(40, 40),
@@ -243,6 +366,7 @@ const previewWireMaterial = new THREE.MeshBasicMaterial({
 })
 
 let showWireframe = wireToggle.checked
+let reflectionsEnabled = reflectionToggle.checked
 
 const handleGeometry = new THREE.CylinderGeometry(0.11, 0.11, 0.08, 20)
 const internalDraftPointGeometry = new THREE.SphereGeometry(0.08, 12, 10)
@@ -339,6 +463,17 @@ function warmStartSimulation(simulation: PillowSimulation, targetPressure: numbe
   }
 }
 
+function applyReflectionState(): void {
+  scene.environment = reflectionsEnabled ? reflectionEnvironment.texture : null
+  magentaAccentLight.intensity = reflectionsEnabled ? REFLECTION_ACCENT_INTENSITIES.magenta : 0
+  cyanAccentLight.intensity = reflectionsEnabled ? REFLECTION_ACCENT_INTENSITIES.cyan : 0
+  amberAccentLight.intensity = reflectionsEnabled ? REFLECTION_ACCENT_INTENSITIES.amber : 0
+
+  for (const simulation of pillowSimulations) {
+    simulation.setReflectionEnabled(reflectionsEnabled)
+  }
+}
+
 function rebuildInflatedSimulations(): void {
   if (pillowSimulations.length === 0) {
     return
@@ -361,6 +496,7 @@ function rebuildInflatedSimulations(): void {
       innerSeamCurvature,
     )
     simulation.setWireframeVisible(showWireframe)
+    simulation.setReflectionEnabled(reflectionsEnabled)
     scene.add(simulation.mesh)
     warmStartSimulation(simulation, targetPressure)
     return simulation
@@ -1020,6 +1156,7 @@ function toggleInflation(): void {
         innerSeamCurvature,
       )
       simulation.setWireframeVisible(showWireframe)
+      simulation.setReflectionEnabled(reflectionsEnabled)
       scene.add(simulation.mesh)
       warmStartSimulation(simulation, getPressureValue())
       return simulation
@@ -1186,6 +1323,11 @@ wireToggle.addEventListener('change', () => {
   for (const simulation of pillowSimulations) {
     simulation.setWireframeVisible(showWireframe)
   }
+})
+
+reflectionToggle.addEventListener('change', () => {
+  reflectionsEnabled = reflectionToggle.checked
+  applyReflectionState()
 })
 
 renderer.domElement.addEventListener('contextmenu', (event) => {
@@ -1580,7 +1722,12 @@ outerSeamCurvatureValue.textContent = `${outerSeamCurvature}`
 innerSeamCurvatureValue.textContent = `${innerSeamCurvature}`
 updateRangeProgress(outerSeamCurvatureSlider)
 updateRangeProgress(innerSeamCurvatureSlider)
+applyReflectionState()
 requestAnimationFrame(() => {
   document.documentElement.classList.add('ui-ready')
+})
+
+window.addEventListener('beforeunload', () => {
+  reflectionEnvironment.dispose()
 })
 renderer.setAnimationLoop(animate)
