@@ -106,7 +106,7 @@ export function validateOutline(points: readonly OutlinePoint[], closed: boolean
 
   return {
     valid: true,
-    error: 'Outline can be closed when you are ready.',
+    error: 'Click the first point to close the seam.',
   }
 }
 
