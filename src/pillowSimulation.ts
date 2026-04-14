@@ -91,6 +91,7 @@ const DEFAULT_PARAMS: SimulationParams = {
 }
 
 const MIDPLANE_EPSILON = 0.0025
+const WIRE_SURFACE_OFFSET = 0.008
 const FOIL_MATERIAL_STYLE = {
   color: 0xf1f5ff,
   metalness: 1,
@@ -129,7 +130,8 @@ export class PillowSimulation {
   readonly mesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshPhysicalMaterial>
   readonly state: PillowSimulationState
 
-  private readonly wireOverlay: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>
+  private readonly wireEdgePairs: number[]
+  private readonly wireOverlay: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>
   private readonly forces: THREE.Vector3[]
   private readonly previousPositions: THREE.Vector3[]
   private readonly pinnedMask: boolean[]
@@ -184,7 +186,8 @@ export class PillowSimulation {
 
     const geometry = new THREE.BufferGeometry()
     const positionsArray = new Float32Array(simData.positions.length * 3)
-    const indices = [...simData.frontTriangles, ...simData.backTriangles].flat()
+    const combinedTriangles = [...simData.frontTriangles, ...simData.backTriangles]
+    const indices = combinedTriangles.flat()
 
     geometry.setAttribute('position', new THREE.BufferAttribute(positionsArray, 3))
     geometry.setIndex(indices)
@@ -197,7 +200,7 @@ export class PillowSimulation {
       basePositions: simData.basePositions,
       seamIndices: simData.seamIndices,
       springs: simData.springs,
-      triangles: [...simData.frontTriangles, ...simData.backTriangles],
+      triangles: combinedTriangles,
       frontTriangles: simData.frontTriangles,
       backTriangles: simData.backTriangles,
       geometry,
@@ -205,6 +208,7 @@ export class PillowSimulation {
 
     this.forces = simData.positions.map(() => new THREE.Vector3())
     this.previousPositions = simData.positions.map((position) => position.clone())
+    this.wireEdgePairs = buildWireEdgePairs(combinedTriangles)
 
     this.mesh = new THREE.Mesh(
       geometry,
@@ -223,20 +227,30 @@ export class PillowSimulation {
         sheen: FOIL_MATERIAL_STYLE.sheen,
         sheenRoughness: FOIL_MATERIAL_STYLE.sheenRoughness,
         sheenColor: new THREE.Color(FOIL_MATERIAL_STYLE.sheenColor),
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
       }),
     )
-    this.wireOverlay = new THREE.Mesh(
-      geometry,
-      new THREE.MeshBasicMaterial({
+    const wireGeometry = new THREE.BufferGeometry()
+    wireGeometry.setAttribute(
+      'position',
+      new THREE.BufferAttribute(new Float32Array(this.wireEdgePairs.length * 3), 3),
+    )
+
+    this.wireOverlay = new THREE.LineSegments(
+      wireGeometry,
+      new THREE.LineBasicMaterial({
         color: 0x37506c,
-        wireframe: true,
         transparent: true,
-        opacity: 0.3,
+        opacity: 0.38,
         depthWrite: false,
+        toneMapped: false,
       }),
     )
     this.wireOverlay.visible = false
-    this.wireOverlay.renderOrder = 2
+    this.wireOverlay.frustumCulled = false
+    this.wireOverlay.renderOrder = 3
     this.mesh.add(this.wireOverlay)
     this.mesh.castShadow = true
     this.mesh.receiveShadow = false
@@ -342,6 +356,7 @@ export class PillowSimulation {
   dispose(): void {
     this.mesh.geometry.dispose()
     this.mesh.material.dispose()
+    this.wireOverlay.geometry.dispose()
     this.wireOverlay.material.dispose()
   }
 
@@ -688,6 +703,27 @@ export class PillowSimulation {
     positionAttribute.needsUpdate = true
     this.state.geometry.computeVertexNormals()
     this.state.geometry.computeBoundingSphere()
+
+    const normalAttribute = this.state.geometry.getAttribute('normal') as THREE.BufferAttribute
+    const wirePositionAttribute = this.wireOverlay.geometry.getAttribute('position') as THREE.BufferAttribute
+
+    for (let slot = 0; slot < this.wireEdgePairs.length; slot += 1) {
+      const vertexIndex = this.wireEdgePairs[slot]
+      const position = this.state.positions[vertexIndex]
+      const normalX = normalAttribute.getX(vertexIndex)
+      const normalY = normalAttribute.getY(vertexIndex)
+      const normalZ = normalAttribute.getZ(vertexIndex)
+
+      wirePositionAttribute.setXYZ(
+        slot,
+        position.x + normalX * WIRE_SURFACE_OFFSET,
+        position.y + normalY * WIRE_SURFACE_OFFSET,
+        position.z + normalZ * WIRE_SURFACE_OFFSET,
+      )
+    }
+
+    wirePositionAttribute.needsUpdate = true
+    this.wireOverlay.geometry.computeBoundingSphere()
   }
 }
 
@@ -985,6 +1021,28 @@ function buildSpringConstraints(
   backTriangles.forEach(addTriangleEdges)
 
   return [...edgeMap.values()]
+}
+
+function buildWireEdgePairs(triangles: readonly TriangleIndices[]): number[] {
+  const edgeMap = new Map<string, [number, number]>()
+
+  const addEdge = (indexA: number, indexB: number): void => {
+    const minIndex = Math.min(indexA, indexB)
+    const maxIndex = Math.max(indexA, indexB)
+    const key = `${minIndex}:${maxIndex}`
+
+    if (!edgeMap.has(key)) {
+      edgeMap.set(key, [indexA, indexB])
+    }
+  }
+
+  for (const [indexA, indexB, indexC] of triangles) {
+    addEdge(indexA, indexB)
+    addEdge(indexB, indexC)
+    addEdge(indexC, indexA)
+  }
+
+  return [...edgeMap.values()].flat()
 }
 
 function addEdge(
