@@ -4,12 +4,15 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 
 import {
+  buildSubdividedPath,
   buildShape,
   cloneOutlinePoints,
   createEditableOutline,
+  getOutlineVectors,
   pointInOutline,
   type EditableOutline,
   type OutlinePoint,
+  validatePathVectors,
   validateOutline,
 } from './geometry'
 import { buildPillowFromOutline, type PillowSimulation } from './pillowSimulation'
@@ -61,28 +64,63 @@ const app = document.querySelector<HTMLDivElement>('#app') ?? (() => {
 app.innerHTML = `
   <div class="app-shell">
     <canvas class="viewport" aria-label="Inflate pillow viewport"></canvas>
-    <section class="hud brand-panel">
-      <p class="eyebrow">Three.js seam inflator</p>
-      <h1>260414_InflatePillow</h1>
-      <p class="lede">Draw stitched outlines on the floor, select a closed one to add chamber seams, then pump every closed seam into a two-sided pillow.</p>
-    </section>
-    <section class="hud control-panel">
-      <div class="control-grid">
-        <button id="undoButton" type="button">Undo</button>
-        <button id="resetButton" type="button">Reset</button>
-        <button id="inflateButton" type="button">Inflate</button>
+    <section id="ui-panel" class="apple-panel" aria-label="Inflate pillow controls">
+      <div id="ui-handle" class="panel-drag-handle">
+        <button
+          id="collapseToggle"
+          class="collapse-button panel-collapse-toggle"
+          type="button"
+          aria-label="Collapse controls"
+          aria-expanded="true"
+        >
+          <span class="collapse-icon" aria-hidden="true"></span>
+        </button>
       </div>
-      <label class="slider-block" for="pressureSlider">
-        <span>Pressure</span>
-        <span id="pressureValue">0.42</span>
-      </label>
-      <input id="pressureSlider" type="range" min="0" max="1" value="0.42" step="0.01" />
-      <label class="toggle-row" for="wireToggle">
-        <span>Mesh Wires</span>
-        <input id="wireToggle" type="checkbox" checked />
-      </label>
-      <p id="statusText" class="status-text"></p>
-      <p class="hint-text">Left click adds outer corners. Click the first point to close an outline. Click a closed outline to select it, then click inside it to draw chamber seams. In inflate mode, left drag on a pillow presses it in and release lets it bounce with a ripple. A quick tap gives a sharper rebound. Right mouse drag orbits the camera. Middle mouse drag pans.</p>
+      <div class="ui-body panel-sections">
+        <p class="control-hint">Wheel = Zoom, MMB = Pan, RMB = Orbit</p>
+        <section class="panel-section">
+          <button class="panel-section-header" type="button" aria-expanded="true">
+            <span class="panel-section-label">Simulation</span>
+          </button>
+          <div class="panel-section-content panel-controls-stack">
+            <div class="control control-grid-2">
+              <button id="inflateButton" class="pill-button action-button" type="button">Start</button>
+              <button id="resetButton" class="pill-button reset-button" type="button">Reset</button>
+            </div>
+            <label class="control" for="pressureSlider">
+              <div class="control-row">
+                <span>Pressure</span>
+                <span id="pressure-value">0.42</span>
+              </div>
+              <input id="pressureSlider" type="range" min="0" max="1" value="0.42" step="0.01" />
+            </label>
+          </div>
+        </section>
+        <section class="panel-section">
+          <button class="panel-section-header" type="button" aria-expanded="true">
+            <span class="panel-section-label">Seams</span>
+          </button>
+          <div class="panel-section-content panel-controls-stack">
+            <label class="control" for="seamCurvature">
+              <div class="control-row">
+                <span>Seam Curvature</span>
+                <span id="seam-curvature-value">1</span>
+              </div>
+              <input id="seamCurvature" type="range" min="1" max="12" value="1" step="1" />
+            </label>
+            <div class="control control-grid-2">
+              <button id="undoButton" class="pill-button" type="button">Undo</button>
+            </div>
+            <label class="toggle-control" for="wireToggle">
+              <span>Mesh Wires</span>
+              <input id="wireToggle" type="checkbox" checked />
+            </label>
+            <p id="statusText" class="status-text"></p>
+          </div>
+        </section>
+        <p class="hint-text">Click the first outer point to close an outline. Click a closed outline to add chamber seams. In inflate mode, left drag presses a pillow and a quick tap gives a stronger ripple rebound.</p>
+      </div>
+      <div id="ui-handle-bottom"></div>
     </section>
   </div>
 `
@@ -97,11 +135,17 @@ function requireElement<T extends Element>(selector: string): T {
 }
 
 const canvas = requireElement<HTMLCanvasElement>('.viewport')
+const uiPanel = requireElement<HTMLDivElement>('#ui-panel')
+const uiHandleTop = requireElement<HTMLDivElement>('#ui-handle')
+const uiHandleBottom = requireElement<HTMLDivElement>('#ui-handle-bottom')
+const collapseToggle = requireElement<HTMLButtonElement>('#collapseToggle')
 const undoButton = requireElement<HTMLButtonElement>('#undoButton')
 const resetButton = requireElement<HTMLButtonElement>('#resetButton')
 const inflateButton = requireElement<HTMLButtonElement>('#inflateButton')
+const seamCurvatureSlider = requireElement<HTMLInputElement>('#seamCurvature')
+const seamCurvatureValue = requireElement<HTMLSpanElement>('#seam-curvature-value')
 const pressureSlider = requireElement<HTMLInputElement>('#pressureSlider')
-const pressureValue = requireElement<HTMLSpanElement>('#pressureValue')
+const pressureValue = requireElement<HTMLSpanElement>('#pressure-value')
 const wireToggle = requireElement<HTMLInputElement>('#wireToggle')
 const statusText = requireElement<HTMLParagraphElement>('#statusText')
 
@@ -138,6 +182,8 @@ const keyLight = new THREE.DirectionalLight(0xffffff, 1.5)
 keyLight.position.set(6, 11, 4)
 keyLight.castShadow = true
 keyLight.shadow.mapSize.set(2048, 2048)
+keyLight.shadow.bias = -0.00015
+keyLight.shadow.normalBias = 0.045
 keyLight.shadow.camera.near = 0.5
 keyLight.shadow.camera.far = 40
 keyLight.shadow.camera.left = -12
@@ -211,6 +257,8 @@ let internalPathDraft: OutlinePoint[] = []
 let draggingHandle: HandleTarget | null = null
 let pendingHandleClick: PendingHandleClick | null = null
 let activePressInteraction: ActivePressInteraction | null = null
+let draggingPanel = false
+let seamCurvature = Math.max(1, Math.round(Number.parseFloat(seamCurvatureSlider.value) || 1))
 
 const CLICK_DRAG_THRESHOLD = 6
 const INTERNAL_SNAP_DISTANCE = 0.32
@@ -218,6 +266,7 @@ const INTERNAL_FINISH_DISTANCE = 0.2
 const MIN_INTERNAL_SEGMENT_LENGTH = 0.06
 const QUICK_TAP_DURATION_MS = 170
 const QUICK_TAP_TRAVEL = 0.32
+const panelDragOffset = { x: 0, y: 0 }
 
 function createOutlineRecord(): OutlineRecord {
   return {
@@ -243,6 +292,65 @@ function makeHandleMaterial(color: number): THREE.MeshStandardMaterial {
 
 function getPressureValue(): number {
   return Number.parseFloat(pressureSlider.value)
+}
+
+function updateRangeProgress(input: HTMLInputElement): void {
+  const min = Number.parseFloat(input.min || '0')
+  const max = Number.parseFloat(input.max || '1')
+  const value = Number.parseFloat(input.value)
+  const span = Math.max(max - min, 1e-6)
+  const progress = THREE.MathUtils.clamp((value - min) / span, 0, 1)
+  input.style.setProperty('--range-progress', `${(progress * 100).toFixed(3)}%`)
+}
+
+function getCurvedOutlinePoints(points: readonly OutlinePoint[], closed = true): THREE.Vector2[] {
+  return buildSubdividedPath(points, closed, seamCurvature)
+}
+
+function buildLineGeometryFromVectors(points: readonly THREE.Vector2[]): THREE.BufferGeometry {
+  const positions: number[] = []
+  for (const point of points) {
+    positions.push(point.x, 0, point.y)
+  }
+
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+  return geometry
+}
+
+function warmStartSimulation(simulation: PillowSimulation, targetPressure: number, steps = 18): void {
+  for (let step = 0; step < steps; step += 1) {
+    simulation.update(1 / 60, targetPressure)
+  }
+}
+
+function rebuildInflatedSimulations(): void {
+  if (pillowSimulations.length === 0) {
+    return
+  }
+
+  const targetPressure = getPressureValue()
+  const wasRunning = hasActivatedInflation
+  activePressInteraction?.simulation.endPress()
+  activePressInteraction = null
+  disposeSimulations()
+
+  pillowSimulations = closedOutlineRecords.map((record) => {
+    const simulation = buildPillowFromOutline(
+      cloneOutlinePoints(record.outline.points),
+      record.internalPaths.map((path) => cloneOutlinePoints(path.points)),
+      seamCurvature,
+    )
+    simulation.setWireframeVisible(showWireframe)
+    scene.add(simulation.mesh)
+    warmStartSimulation(simulation, targetPressure)
+    return simulation
+  })
+
+  hasActivatedInflation = wasRunning
+  clearPreviewMeshes()
+  rebuildHandles()
+  refreshOutlineState()
 }
 
 function getAllOutlineRecords(): OutlineRecord[] {
@@ -304,6 +412,15 @@ function clearSelection(): void {
 function refreshOutlineState(): void {
   for (const record of getAllOutlineRecords()) {
     const validation = validateOutline(record.outline.points, record.outline.closed)
+    if (validation.valid && record.outline.closed) {
+      const curvedValidation = validatePathVectors(getCurvedOutlinePoints(record.outline.points), true)
+      if (!curvedValidation.valid) {
+        record.outline.valid = false
+        record.outline.error = curvedValidation.error
+        continue
+      }
+    }
+
     record.outline.valid = validation.valid
     record.outline.error = validation.error
   }
@@ -314,16 +431,19 @@ function refreshOutlineState(): void {
   const closedOutlineCount = closedOutlineRecords.length
   const hasOpenOuterDraft = activeOutline.points.length > 0
   const hasInternalDraft = internalPathDraft.length > 0
-  const canInflate =
-    !hasOpenOuterDraft &&
-    !hasInternalDraft &&
-    closedOutlineCount > 0 &&
-    !invalidClosedOutline
+  const hasInflatedMeshes = pillowSimulations.length > 0
+  const isRunning = hasInflatedMeshes && hasActivatedInflation
 
   pressureValue.textContent = getPressureValue().toFixed(2)
+  updateRangeProgress(pressureSlider)
+  inflateButton.textContent = isRunning ? 'Pause' : 'Start'
+  inflateButton.classList.toggle('is-start-state', !isRunning)
+  inflateButton.classList.toggle('is-stop-state', isRunning)
 
-  if (pillowSimulations.length > 0 && hasActivatedInflation) {
+  if (isRunning) {
     statusText.textContent = `Pumping ${formatPillowCount(pillowSimulations.length)} toward ${getPressureValue().toFixed(2)} pressure. Left drag presses a pillow in, release lets it ripple back, and a quick tap gives a stronger bounce.`
+  } else if (hasInflatedMeshes) {
+    statusText.textContent = `Paused ${formatPillowCount(pillowSimulations.length)}. Press Start to resume, or Reset to return to seam editing.`
   } else if (hasOpenOuterDraft) {
     const readySuffix =
       closedOutlineCount > 0
@@ -349,11 +469,8 @@ function refreshOutlineState(): void {
       internalPathDraft.length === 0 &&
       !(selectedOutline && selectedOutline.internalPaths.length > 0)
     )
-  inflateButton.disabled = !canInflate
-  resetButton.disabled =
-    pillowSimulations.length === 0 &&
-    closedOutlineCount === 0 &&
-    activeOutline.points.length === 0
+  inflateButton.disabled = false
+  resetButton.disabled = false
 }
 
 function clearPreviewMeshes(): void {
@@ -381,7 +498,7 @@ function rebuildPreviewMeshes(): void {
       continue
     }
 
-    const shape = buildShape(record.outline.points)
+    const shape = buildShape(record.outline.points, seamCurvature)
     if (!shape) {
       continue
     }
@@ -428,17 +545,6 @@ function clearInternalDraftMarkers(): void {
   }
 }
 
-function buildLineGeometry(points: readonly OutlinePoint[]): THREE.BufferGeometry {
-  const positions: number[] = []
-  for (const point of points) {
-    positions.push(point.position.x, 0, point.position.y)
-  }
-
-  const geometry = new THREE.BufferGeometry()
-  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
-  return geometry
-}
-
 function rebuildSeamLines(): void {
   clearSeamLines()
   clearInternalDraftMarkers()
@@ -450,7 +556,7 @@ function rebuildSeamLines(): void {
 
     const isSelected = record.id === selectedOutlineId
     const outerLine = new THREE.LineLoop(
-      buildLineGeometry(record.outline.points),
+      buildLineGeometryFromVectors(getCurvedOutlinePoints(record.outline.points)),
       isSelected ? selectedOuterSeamMaterial : outerSeamMaterial,
     )
     seamGroup.add(outerLine)
@@ -461,7 +567,7 @@ function rebuildSeamLines(): void {
       }
 
       const internalLine = new THREE.Line(
-        buildLineGeometry(internalPath.points),
+        buildLineGeometryFromVectors(getOutlineVectors(internalPath.points)),
         isSelected ? selectedInternalSeamMaterial : internalSeamMaterial,
       )
       seamGroup.add(internalLine)
@@ -470,12 +576,18 @@ function rebuildSeamLines(): void {
 
   const activeOutline = getActiveOutline()
   if (activeOutline.points.length >= 2) {
-    const line = new THREE.Line(buildLineGeometry(activeOutline.points), outerSeamMaterial)
+    const line = new THREE.Line(
+      buildLineGeometryFromVectors(getCurvedOutlinePoints(activeOutline.points, false)),
+      outerSeamMaterial,
+    )
     seamGroup.add(line)
   }
 
   if (internalPathDraft.length >= 2) {
-    const line = new THREE.Line(buildLineGeometry(internalPathDraft), internalDraftMaterial)
+    const line = new THREE.Line(
+      buildLineGeometryFromVectors(getOutlineVectors(internalPathDraft)),
+      internalDraftMaterial,
+    )
     seamGroup.add(line)
   }
 
@@ -736,7 +848,12 @@ function getSnapTargetForPath(
 }
 
 function getInternalSnapTarget(record: OutlineRecord, position: THREE.Vector2): SnapTarget | null {
-  let bestTarget = getSnapTargetForPath(record.outline.points, true, position)
+  const curvedOutline = getCurvedOutlinePoints(record.outline.points)
+  let bestTarget = getSnapTargetForPath(
+    curvedOutline.map((point, index) => ({ id: -(index + 1), position: point })),
+    true,
+    position,
+  )
 
   for (const internalPath of record.internalPaths) {
     const candidate = getSnapTargetForPath(internalPath.points, false, position)
@@ -797,7 +914,23 @@ function selectOutline(outlineId: number | null): void {
   syncOutlineVisuals()
 }
 
-function inflateOutlines(): void {
+function toggleInflation(): void {
+  if (pillowSimulations.length > 0) {
+    if (hasActivatedInflation) {
+      activePressInteraction?.simulation.endPress()
+      activePressInteraction = null
+      hasActivatedInflation = false
+    } else {
+      hasActivatedInflation = true
+      for (const simulation of pillowSimulations) {
+        simulation.update(0, getPressureValue())
+      }
+    }
+
+    refreshOutlineState()
+    return
+  }
+
   const activeOutline = getActiveOutline()
   const invalidClosedOutline = closedOutlineRecords.find((record) => !record.outline.valid)
   if (
@@ -814,9 +947,11 @@ function inflateOutlines(): void {
       const simulation = buildPillowFromOutline(
         cloneOutlinePoints(record.outline.points),
         record.internalPaths.map((path) => cloneOutlinePoints(path.points)),
+        seamCurvature,
       )
       simulation.setWireframeVisible(showWireframe)
       scene.add(simulation.mesh)
+      warmStartSimulation(simulation, getPressureValue())
       return simulation
     })
 
@@ -850,6 +985,60 @@ function handleReset(): void {
   syncOutlineVisuals()
 }
 
+function clampPanelToViewport(): void {
+  if (window.innerWidth <= 700) {
+    uiPanel.style.left = ''
+    uiPanel.style.top = ''
+    return
+  }
+
+  const rect = uiPanel.getBoundingClientRect()
+  const maxLeft = Math.max(12, window.innerWidth - rect.width - 12)
+  const maxTop = Math.max(12, window.innerHeight - rect.height - 12)
+  const nextLeft = THREE.MathUtils.clamp(rect.left, 12, maxLeft)
+  const nextTop = THREE.MathUtils.clamp(rect.top, 12, maxTop)
+
+  uiPanel.style.left = `${nextLeft}px`
+  uiPanel.style.top = `${nextTop}px`
+  uiPanel.style.right = 'auto'
+  uiPanel.style.bottom = 'auto'
+}
+
+function bindSectionCollapses(): void {
+  const headers = app.querySelectorAll<HTMLButtonElement>('.panel-section-header')
+  for (const header of headers) {
+    header.addEventListener('click', () => {
+      const section = header.closest<HTMLElement>('.panel-section')
+      if (!section) {
+        return
+      }
+
+      const collapsed = section.classList.toggle('is-collapsed')
+      header.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
+    })
+  }
+}
+
+function beginPanelDrag(event: PointerEvent): void {
+  if (window.innerWidth <= 700) {
+    return
+  }
+
+  if (event.target instanceof Element && event.target.closest('.collapse-button')) {
+    return
+  }
+
+  const rect = uiPanel.getBoundingClientRect()
+  draggingPanel = true
+  panelDragOffset.x = event.clientX - rect.left
+  panelDragOffset.y = event.clientY - rect.top
+  uiPanel.style.left = `${rect.left}px`
+  uiPanel.style.top = `${rect.top}px`
+  uiPanel.style.right = 'auto'
+  uiPanel.style.bottom = 'auto'
+  ;(event.currentTarget as HTMLElement | null)?.setPointerCapture(event.pointerId)
+}
+
 undoButton.addEventListener('click', () => {
   if (pillowSimulations.length > 0) {
     return
@@ -876,8 +1065,23 @@ undoButton.addEventListener('click', () => {
   }
 })
 
-inflateButton.addEventListener('click', inflateOutlines)
+inflateButton.addEventListener('click', toggleInflation)
 resetButton.addEventListener('click', handleReset)
+
+seamCurvatureSlider.addEventListener('input', () => {
+  const nextCurvature = Math.max(1, Math.round(Number.parseFloat(seamCurvatureSlider.value) || 1))
+  seamCurvature = nextCurvature
+  seamCurvatureSlider.value = `${nextCurvature}`
+  seamCurvatureValue.textContent = `${nextCurvature}`
+  updateRangeProgress(seamCurvatureSlider)
+
+  if (pillowSimulations.length > 0) {
+    rebuildInflatedSimulations()
+    return
+  }
+
+  syncOutlineVisuals()
+})
 
 pressureSlider.addEventListener('input', () => {
   pressureValue.textContent = getPressureValue().toFixed(2)
@@ -902,6 +1106,23 @@ wireToggle.addEventListener('change', () => {
 renderer.domElement.addEventListener('contextmenu', (event) => {
   event.preventDefault()
 })
+
+uiPanel.addEventListener('contextmenu', (event) => {
+  event.preventDefault()
+})
+
+collapseToggle.addEventListener('pointerdown', (event) => {
+  event.stopPropagation()
+})
+
+collapseToggle.addEventListener('click', () => {
+  const collapsed = uiPanel.classList.toggle('is-collapsed')
+  collapseToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
+  clampPanelToViewport()
+})
+
+uiHandleTop.addEventListener('pointerdown', beginPanelDrag)
+uiHandleBottom.addEventListener('pointerdown', beginPanelDrag)
 
 renderer.domElement.addEventListener(
   'pointerdown',
@@ -954,6 +1175,11 @@ renderer.domElement.addEventListener(
     }
 
     if (pillowSimulations.length > 0) {
+      if (!hasActivatedInflation) {
+        controls.enabled = true
+        return
+      }
+
       const meshHit = pickInflatedMesh(event.clientX, event.clientY)
       const simulation = meshHit ? findSimulationForObject(meshHit.object) : null
       if (simulation) {
@@ -1002,7 +1228,7 @@ renderer.domElement.addEventListener(
       const groundVector = toGroundVector(point)
       if (
         previewOutlineId === selectedOutline.id ||
-        pointInOutline(groundVector, selectedOutline.outline.points) ||
+        pointInOutline(groundVector, getCurvedOutlinePoints(selectedOutline.outline.points)) ||
         getInternalSnapTarget(selectedOutline, groundVector)
       ) {
         if (tryAddInternalSeamPoint(selectedOutline, groundVector)) {
@@ -1172,6 +1398,46 @@ renderer.domElement.addEventListener('pointercancel', () => {
   refreshOutlineState()
 })
 
+window.addEventListener('pointermove', (event) => {
+  if (!draggingPanel) {
+    return
+  }
+
+  uiPanel.style.left = `${event.clientX - panelDragOffset.x}px`
+  uiPanel.style.top = `${event.clientY - panelDragOffset.y}px`
+  uiPanel.style.right = 'auto'
+  uiPanel.style.bottom = 'auto'
+  clampPanelToViewport()
+})
+
+window.addEventListener('pointerup', (event) => {
+  if (!draggingPanel) {
+    return
+  }
+
+  draggingPanel = false
+  if (uiHandleTop.hasPointerCapture(event.pointerId)) {
+    uiHandleTop.releasePointerCapture(event.pointerId)
+  }
+  if (uiHandleBottom.hasPointerCapture(event.pointerId)) {
+    uiHandleBottom.releasePointerCapture(event.pointerId)
+  }
+})
+
+window.addEventListener('pointercancel', (event) => {
+  if (!draggingPanel) {
+    return
+  }
+
+  draggingPanel = false
+  if (uiHandleTop.hasPointerCapture(event.pointerId)) {
+    uiHandleTop.releasePointerCapture(event.pointerId)
+  }
+  if (uiHandleBottom.hasPointerCapture(event.pointerId)) {
+    uiHandleBottom.releasePointerCapture(event.pointerId)
+  }
+})
+
 window.addEventListener('resize', onResize)
 
 function onResize(): void {
@@ -1182,6 +1448,7 @@ function onResize(): void {
   camera.updateProjectionMatrix()
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
   renderer.setSize(width, height, false)
+  clampPanelToViewport()
 }
 
 function animate(): void {
@@ -1199,4 +1466,10 @@ function animate(): void {
 
 syncOutlineVisuals()
 onResize()
+bindSectionCollapses()
+seamCurvatureValue.textContent = `${seamCurvature}`
+updateRangeProgress(seamCurvatureSlider)
+requestAnimationFrame(() => {
+  document.documentElement.classList.add('ui-ready')
+})
 renderer.setAnimationLoop(animate)

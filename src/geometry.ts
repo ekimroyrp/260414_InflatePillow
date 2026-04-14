@@ -61,6 +61,42 @@ export function getOutlineVectors(points: readonly OutlinePoint[]): THREE.Vector
   return points.map((point) => point.position.clone())
 }
 
+export function buildSubdividedPath(
+  points: readonly OutlinePoint[] | readonly THREE.Vector2[],
+  closed: boolean,
+  subdivision: number,
+): THREE.Vector2[] {
+  const source =
+    points.length > 0 && 'position' in points[0]
+      ? getOutlineVectors(points as readonly OutlinePoint[])
+      : (points as readonly THREE.Vector2[]).map((point) => point.clone())
+
+  const safeSubdivision = Math.max(1, Math.round(subdivision))
+  if (source.length < 2 || safeSubdivision <= 1) {
+    return source
+  }
+
+  const controls = source.map((point) => new THREE.Vector3(point.x, point.y, 0))
+  const curve = new THREE.CatmullRomCurve3(controls, closed, 'centripetal')
+  const segmentCount = closed ? controls.length : controls.length - 1
+  const sampleCount = Math.max(closed ? 3 : 2, segmentCount * safeSubdivision)
+  const result: THREE.Vector2[] = []
+
+  if (closed) {
+    for (let index = 0; index < sampleCount; index += 1) {
+      const sample = curve.getPoint(index / sampleCount)
+      appendUniqueVector(result, new THREE.Vector2(sample.x, sample.y))
+    }
+  } else {
+    for (let index = 0; index <= sampleCount; index += 1) {
+      const sample = curve.getPoint(index / sampleCount)
+      appendUniqueVector(result, new THREE.Vector2(sample.x, sample.y))
+    }
+  }
+
+  return result
+}
+
 export function computeSignedArea(points: readonly THREE.Vector2[]): number {
   let area = 0
 
@@ -117,6 +153,45 @@ export function validateOutline(points: readonly OutlinePoint[], closed: boolean
   }
 }
 
+export function validatePathVectors(
+  points: readonly THREE.Vector2[],
+  closed: boolean,
+): OutlineValidation {
+  if (points.length < 3) {
+    return {
+      valid: false,
+      error: 'Add at least three corners to define a seam.',
+    }
+  }
+
+  if (hasSelfIntersection(points, closed)) {
+    return {
+      valid: false,
+      error: 'Seam curvature crosses itself. Lower Seam Curvature or move a corner.',
+    }
+  }
+
+  if (closed) {
+    const area = Math.abs(computeSignedArea(points))
+    if (area < MIN_AREA) {
+      return {
+        valid: false,
+        error: 'Curved seam is too small to inflate cleanly.',
+      }
+    }
+
+    return {
+      valid: true,
+      error: 'Closed seam is ready to inflate.',
+    }
+  }
+
+  return {
+    valid: true,
+    error: 'Click the first point to close the seam.',
+  }
+}
+
 export function pointInOutline(
   point: THREE.Vector2,
   outline: readonly OutlinePoint[] | readonly THREE.Vector2[],
@@ -132,8 +207,10 @@ export function pointInOutline(
 export function buildFlatMeshData(
   points: readonly OutlinePoint[],
   internalSeams: readonly (readonly OutlinePoint[])[] = [],
+  seamCurvature = 1,
 ): FlatMeshData {
-  const contour = normalizeCounterClockwise(getOutlineVectors(points))
+  const rawContour = normalizeCounterClockwise(getOutlineVectors(points))
+  const contour = normalizeCounterClockwise(buildSubdividedPath(rawContour, true, seamCurvature))
   const area = Math.abs(computeSignedArea(contour))
   const perimeter = computePerimeter(contour)
   const targetSpacing = computeTargetSpacing(area, perimeter)
@@ -148,8 +225,14 @@ export function buildFlatMeshData(
       continue
     }
 
-    const sampledSeam = resampleOpenPath(
+    const projectedSeam = projectOpenSeamEndpoints(
       getOutlineVectors(seam),
+      rawContour,
+      sampledContour,
+      Math.max(targetSpacing * 1.4, 0.16),
+    )
+    const sampledSeam = resampleOpenPath(
+      projectedSeam,
       THREE.MathUtils.clamp(targetSpacing, 0.12, 0.36),
     )
 
@@ -184,12 +267,12 @@ export function buildFlatMeshData(
   }
 }
 
-export function buildShape(points: readonly OutlinePoint[]): THREE.Shape | null {
+export function buildShape(points: readonly OutlinePoint[], seamCurvature = 1): THREE.Shape | null {
   if (points.length < 3) {
     return null
   }
 
-  const contour = normalizeCounterClockwise(getOutlineVectors(points))
+  const contour = normalizeCounterClockwise(buildSubdividedPath(points, true, seamCurvature))
   const shape = new THREE.Shape(contour)
   shape.autoClose = true
   return shape
@@ -222,6 +305,13 @@ function appendUniqueVertices(
     target.push(candidate.clone())
     boundaryVertexIndices?.add(nextIndex)
     stitchedVertexIndices?.add(nextIndex)
+  }
+}
+
+function appendUniqueVector(target: THREE.Vector2[], candidate: THREE.Vector2): void {
+  const previous = target[target.length - 1]
+  if (!previous || previous.distanceToSquared(candidate) > EPSILON) {
+    target.push(candidate)
   }
 }
 
@@ -286,6 +376,94 @@ function resampleOpenPath(points: readonly THREE.Vector2[], targetSpacing: numbe
   }
 
   return path
+}
+
+function projectOpenSeamEndpoints(
+  points: readonly THREE.Vector2[],
+  rawContour: readonly THREE.Vector2[],
+  processedContour: readonly THREE.Vector2[],
+  snapDistance: number,
+): THREE.Vector2[] {
+  if (points.length < 2) {
+    return points.map((point) => point.clone())
+  }
+
+  const projected = points.map((point) => point.clone())
+  const firstProjection = projectEndpointToContour(projected[0], rawContour, processedContour, snapDistance)
+  if (firstProjection) {
+    projected[0].copy(firstProjection)
+  }
+
+  const lastIndex = projected.length - 1
+  const lastProjection = projectEndpointToContour(projected[lastIndex], rawContour, processedContour, snapDistance)
+  if (lastProjection) {
+    projected[lastIndex].copy(lastProjection)
+  }
+
+  return projected
+}
+
+function projectEndpointToContour(
+  point: THREE.Vector2,
+  rawContour: readonly THREE.Vector2[],
+  processedContour: readonly THREE.Vector2[],
+  snapDistance: number,
+): THREE.Vector2 | null {
+  const rawCandidate = closestPointOnPolyline(point, rawContour, true)
+  const processedCandidate = closestPointOnPolyline(point, processedContour, true)
+  const rawDistance = rawCandidate.distanceTo(point)
+  const processedDistance = processedCandidate.distanceTo(point)
+
+  if (Math.min(rawDistance, processedDistance) > snapDistance) {
+    return null
+  }
+
+  return processedCandidate
+}
+
+function closestPointOnPolyline(
+  point: THREE.Vector2,
+  polyline: readonly THREE.Vector2[],
+  closed: boolean,
+): THREE.Vector2 {
+  let bestPoint = polyline[0]?.clone() ?? new THREE.Vector2()
+  let bestDistanceSquared = Number.POSITIVE_INFINITY
+  const segmentCount = closed ? polyline.length : polyline.length - 1
+
+  for (let index = 0; index < segmentCount; index += 1) {
+    const start = polyline[index]
+    const end = polyline[(index + 1) % polyline.length]
+    const projected = projectPointToSegment(point, start, end)
+    const distanceSquared = projected.distanceToSquared(point)
+
+    if (distanceSquared < bestDistanceSquared) {
+      bestDistanceSquared = distanceSquared
+      bestPoint = projected
+    }
+  }
+
+  return bestPoint
+}
+
+function projectPointToSegment(
+  point: THREE.Vector2,
+  start: THREE.Vector2,
+  end: THREE.Vector2,
+): THREE.Vector2 {
+  const segment = end.clone().sub(start)
+  const segmentLengthSquared = segment.lengthSq()
+
+  if (segmentLengthSquared < EPSILON) {
+    return start.clone()
+  }
+
+  const projection = THREE.MathUtils.clamp(
+    point.clone().sub(start).dot(segment) / segmentLengthSquared,
+    0,
+    1,
+  )
+
+  return start.clone().add(segment.multiplyScalar(projection))
 }
 
 function computePerimeter(points: readonly THREE.Vector2[]): number {

@@ -39,6 +39,10 @@ export interface SimulationParams {
   pressStiffness: number
   releaseImpulse: number
   interactionRadiusScale: number
+  collisionMinGap: number
+  collisionGapScale: number
+  collisionStiffness: number
+  collisionPushBias: number
 }
 
 export interface PillowSimulationState {
@@ -74,7 +78,13 @@ const DEFAULT_PARAMS: SimulationParams = {
   pressStiffness: 56,
   releaseImpulse: 2.6,
   interactionRadiusScale: 1.6,
+  collisionMinGap: 0.05,
+  collisionGapScale: 0.18,
+  collisionStiffness: 0.9,
+  collisionPushBias: 0.78,
 }
+
+const MIDPLANE_EPSILON = 0.0025
 
 export class PillowSimulation {
   readonly mesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>
@@ -102,6 +112,7 @@ export class PillowSimulation {
   constructor(
     outline: readonly OutlinePoint[],
     internalSeams: readonly (readonly OutlinePoint[])[] = [],
+    seamCurvature = 1,
     params: Partial<SimulationParams> = {},
   ) {
     this.params = {
@@ -109,7 +120,7 @@ export class PillowSimulation {
       ...params,
     }
 
-    const flatMesh = buildFlatMeshData(outline, internalSeams)
+    const flatMesh = buildFlatMeshData(outline, internalSeams, seamCurvature)
     const simData = createSimulationTopology(flatMesh, this.params)
 
     this.pinnedMask = simData.pinnedMask
@@ -172,7 +183,7 @@ export class PillowSimulation {
     this.wireOverlay.renderOrder = 2
     this.mesh.add(this.wireOverlay)
     this.mesh.castShadow = true
-    this.mesh.receiveShadow = true
+    this.mesh.receiveShadow = false
     this.mesh.userData.simulation = this
 
     this.syncGeometry()
@@ -306,6 +317,8 @@ export class PillowSimulation {
       this.solveSpringConstraints()
       this.solvePairConstraints()
       this.solveInflationProfile()
+      this.solveSheetCollisions()
+      this.solveMidplaneCaps()
       this.solveSeamConstraints()
     }
 
@@ -416,6 +429,104 @@ export class PillowSimulation {
     }
   }
 
+  private solveSheetCollisions(): void {
+    const inflatedPressure = 1 - Math.pow(1 - this.state.currentPressure, 2)
+
+    for (const constraint of this.pairConstraints) {
+      const frontIndex = constraint.front
+      const backIndex = constraint.back
+      const front = this.state.positions[frontIndex]
+      const back = this.state.positions[backIndex]
+
+      const upperIndex = back.y >= front.y ? backIndex : frontIndex
+      const lowerIndex = upperIndex === backIndex ? frontIndex : backIndex
+      const upper = this.state.positions[upperIndex]
+      const lower = this.state.positions[lowerIndex]
+
+      const weight = Math.max(
+        this.inflationWeights[frontIndex],
+        this.inflationWeights[backIndex],
+      )
+      const minGap =
+        this.params.collisionMinGap +
+        weight * inflatedPressure * this.maxBulge * this.params.collisionGapScale
+
+      const currentGap = upper.y - lower.y
+      if (currentGap >= minGap) {
+        continue
+      }
+
+      const correction = (minGap - currentGap) * this.params.collisionStiffness
+      let upperShare = 0.5
+      let lowerShare = 0.5
+
+      if (this.pressState) {
+        const pressedSide = Math.sign(this.pressState.side)
+        const upperSign = Math.sign(this.inflationSigns[upperIndex])
+        const lowerSign = Math.sign(this.inflationSigns[lowerIndex])
+
+        if (pressedSide !== 0) {
+          if (upperSign === pressedSide) {
+            upperShare = 1 - this.params.collisionPushBias
+            lowerShare = this.params.collisionPushBias
+          } else if (lowerSign === pressedSide) {
+            upperShare = this.params.collisionPushBias
+            lowerShare = 1 - this.params.collisionPushBias
+          }
+        }
+      }
+
+      upper.y += correction * upperShare
+      lower.y -= correction * lowerShare
+    }
+  }
+
+  private solveMidplaneCaps(): void {
+    const inflatedPressure = 1 - Math.pow(1 - this.state.currentPressure, 2)
+
+    for (let index = 0; index < this.state.positions.length; index += 1) {
+      if (this.pinnedMask[index]) {
+        continue
+      }
+
+      const sign = Math.sign(this.inflationSigns[index])
+      if (sign === 0) {
+        continue
+      }
+
+      const weight = this.inflationWeights[index]
+      const baseHeight = sign * weight * inflatedPressure * this.maxBulge
+
+      if (sign > 0) {
+        this.rippleOffsets[index] = Math.max(this.rippleOffsets[index], -baseHeight)
+
+        if (this.state.positions[index].y < MIDPLANE_EPSILON) {
+          this.state.positions[index].y = MIDPLANE_EPSILON
+          this.previousPositions[index].y = MIDPLANE_EPSILON
+          if (this.state.velocities[index].y < 0) {
+            this.state.velocities[index].y = 0
+          }
+          if (this.rippleVelocities[index] < 0) {
+            this.rippleVelocities[index] = 0
+          }
+        }
+      } else {
+        this.rippleOffsets[index] = Math.min(this.rippleOffsets[index], -baseHeight)
+
+        if (this.state.positions[index].y > -MIDPLANE_EPSILON) {
+          this.state.positions[index].y = -MIDPLANE_EPSILON
+          this.previousPositions[index].y = -MIDPLANE_EPSILON
+          if (this.state.velocities[index].y > 0) {
+            this.state.velocities[index].y = 0
+          }
+          if (this.rippleVelocities[index] > 0) {
+            this.rippleVelocities[index] = 0
+          }
+        }
+      }
+    }
+  }
+
   private updateRippleField(deltaTime: number): void {
     const accelerations = new Array<number>(this.rippleOffsets.length).fill(0)
 
@@ -505,9 +616,10 @@ export class PillowSimulation {
 export function buildPillowFromOutline(
   outline: readonly OutlinePoint[],
   internalSeams: readonly (readonly OutlinePoint[])[] = [],
+  seamCurvature = 1,
   params?: Partial<SimulationParams>,
 ): PillowSimulation {
-  return new PillowSimulation(outline, internalSeams, params)
+  return new PillowSimulation(outline, internalSeams, seamCurvature, params)
 }
 
 function createSimulationTopology(flatMesh: FlatMeshData, params: SimulationParams): {
