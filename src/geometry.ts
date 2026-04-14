@@ -25,6 +25,11 @@ export interface SampledSeamPath {
   closed: boolean
 }
 
+export interface InternalSeamInput {
+  points: readonly OutlinePoint[]
+  closed: boolean
+}
+
 export type TriangleIndices = [number, number, number]
 
 export interface FlatMeshData {
@@ -149,7 +154,7 @@ export function validateOutline(points: readonly OutlinePoint[], closed: boolean
 
   return {
     valid: true,
-    error: 'Click the first point to close the seam.',
+    error: 'Click the first point or press Enter to close the seam.',
   }
 }
 
@@ -188,7 +193,7 @@ export function validatePathVectors(
 
   return {
     valid: true,
-    error: 'Click the first point to close the seam.',
+    error: 'Click the first point or press Enter to close the seam.',
   }
 }
 
@@ -206,11 +211,12 @@ export function pointInOutline(
 
 export function buildFlatMeshData(
   points: readonly OutlinePoint[],
-  internalSeams: readonly (readonly OutlinePoint[])[] = [],
-  seamCurvature = 1,
+  internalSeams: readonly InternalSeamInput[] = [],
+  outerSeamCurvature = 1,
+  innerSeamCurvature = 1,
 ): FlatMeshData {
   const rawContour = normalizeCounterClockwise(getOutlineVectors(points))
-  const contour = normalizeCounterClockwise(buildSubdividedPath(rawContour, true, seamCurvature))
+  const contour = normalizeCounterClockwise(buildSubdividedPath(rawContour, true, outerSeamCurvature))
   const area = Math.abs(computeSignedArea(contour))
   const perimeter = computePerimeter(contour)
   const targetSpacing = computeTargetSpacing(area, perimeter)
@@ -221,12 +227,30 @@ export function buildFlatMeshData(
 
   const seamPaths: SampledSeamPath[] = [{ points: sampledContour, closed: true }]
   for (const seam of internalSeams) {
-    if (seam.length < 2) {
+    if (seam.points.length < (seam.closed ? 3 : 2)) {
       continue
     }
 
+    if (seam.closed) {
+      const curvedSeam = buildSubdividedPath(getOutlineVectors(seam.points), true, innerSeamCurvature)
+      const sampledSeam = resampleClosedContour(
+        curvedSeam,
+        THREE.MathUtils.clamp(
+          Math.round(computePerimeter(curvedSeam) / targetSpacing),
+          curvedSeam.length * 2,
+          180,
+        ),
+      )
+
+      if (sampledSeam.length >= 3) {
+        seamPaths.push({ points: sampledSeam, closed: true })
+      }
+      continue
+    }
+
+    const curvedSeam = buildSubdividedPath(getOutlineVectors(seam.points), false, innerSeamCurvature)
     const projectedSeam = projectOpenSeamEndpoints(
-      getOutlineVectors(seam),
+      curvedSeam,
       rawContour,
       sampledContour,
       Math.max(targetSpacing * 1.4, 0.16),

@@ -268,7 +268,8 @@ input[type="range"]:focus-visible,
 }
 
 #pressure-value,
-#seam-curvature-value {
+#outer-seam-curvature-value,
+#inner-seam-curvature-value {
   min-width: 8ch;
   width: 8ch;
   padding: 1px 4px;

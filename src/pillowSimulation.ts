@@ -1,6 +1,12 @@
 import * as THREE from 'three'
 
-import { buildFlatMeshData, type FlatMeshData, type OutlinePoint, type TriangleIndices } from './geometry'
+import {
+  buildFlatMeshData,
+  type FlatMeshData,
+  type InternalSeamInput,
+  type OutlinePoint,
+  type TriangleIndices,
+} from './geometry'
 
 interface SpringConstraint {
   a: number
@@ -111,8 +117,9 @@ export class PillowSimulation {
 
   constructor(
     outline: readonly OutlinePoint[],
-    internalSeams: readonly (readonly OutlinePoint[])[] = [],
-    seamCurvature = 1,
+    internalSeams: readonly InternalSeamInput[] = [],
+    outerSeamCurvature = 1,
+    innerSeamCurvature = 1,
     params: Partial<SimulationParams> = {},
   ) {
     this.params = {
@@ -120,7 +127,12 @@ export class PillowSimulation {
       ...params,
     }
 
-    const flatMesh = buildFlatMeshData(outline, internalSeams, seamCurvature)
+    const flatMesh = buildFlatMeshData(
+      outline,
+      internalSeams,
+      outerSeamCurvature,
+      innerSeamCurvature,
+    )
     const simData = createSimulationTopology(flatMesh, this.params)
 
     this.pinnedMask = simData.pinnedMask
@@ -615,11 +627,18 @@ export class PillowSimulation {
 
 export function buildPillowFromOutline(
   outline: readonly OutlinePoint[],
-  internalSeams: readonly (readonly OutlinePoint[])[] = [],
-  seamCurvature = 1,
+  internalSeams: readonly InternalSeamInput[] = [],
+  outerSeamCurvature = 1,
+  innerSeamCurvature = 1,
   params?: Partial<SimulationParams>,
 ): PillowSimulation {
-  return new PillowSimulation(outline, internalSeams, seamCurvature, params)
+  return new PillowSimulation(
+    outline,
+    internalSeams,
+    outerSeamCurvature,
+    innerSeamCurvature,
+    params,
+  )
 }
 
 function createSimulationTopology(flatMesh: FlatMeshData, params: SimulationParams): {

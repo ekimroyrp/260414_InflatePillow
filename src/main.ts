@@ -20,6 +20,7 @@ import { buildPillowFromOutline, type PillowSimulation } from './pillowSimulatio
 interface InternalSeamRecord {
   id: number
   points: OutlinePoint[]
+  closed: boolean
 }
 
 interface OutlineRecord {
@@ -101,12 +102,19 @@ app.innerHTML = `
             <span class="panel-section-label">Seams</span>
           </button>
           <div class="panel-section-content panel-controls-stack">
-            <label class="control" for="seamCurvature">
+            <label class="control" for="outerSeamCurvature">
               <div class="control-row">
-                <span>Seam Curvature</span>
-                <span id="seam-curvature-value">1</span>
+                <span>Outer Seam Curvature</span>
+                <span id="outer-seam-curvature-value">1</span>
               </div>
-              <input id="seamCurvature" type="range" min="1" max="12" value="1" step="1" />
+              <input id="outerSeamCurvature" type="range" min="1" max="12" value="1" step="1" />
+            </label>
+            <label class="control" for="innerSeamCurvature">
+              <div class="control-row">
+                <span>Inner Seam Curvature</span>
+                <span id="inner-seam-curvature-value">1</span>
+              </div>
+              <input id="innerSeamCurvature" type="range" min="1" max="12" value="1" step="1" />
             </label>
             <div class="control control-grid-2">
               <button id="undoButton" class="pill-button" type="button">Undo</button>
@@ -118,7 +126,7 @@ app.innerHTML = `
             <p id="statusText" class="status-text"></p>
           </div>
         </section>
-        <p class="hint-text">Click the first outer point to close an outline. Click a closed outline to add chamber seams. In inflate mode, left drag presses a pillow and a quick tap gives a stronger ripple rebound.</p>
+        <p class="hint-text">Click the first outer point or press Enter to close an outline. Click a closed outline to add chamber seams, click the first chamber point to close a loop, and press Enter to end a chamber seam open.</p>
       </div>
       <div id="ui-handle-bottom"></div>
     </section>
@@ -142,8 +150,10 @@ const collapseToggle = requireElement<HTMLButtonElement>('#collapseToggle')
 const undoButton = requireElement<HTMLButtonElement>('#undoButton')
 const resetButton = requireElement<HTMLButtonElement>('#resetButton')
 const inflateButton = requireElement<HTMLButtonElement>('#inflateButton')
-const seamCurvatureSlider = requireElement<HTMLInputElement>('#seamCurvature')
-const seamCurvatureValue = requireElement<HTMLSpanElement>('#seam-curvature-value')
+const outerSeamCurvatureSlider = requireElement<HTMLInputElement>('#outerSeamCurvature')
+const outerSeamCurvatureValue = requireElement<HTMLSpanElement>('#outer-seam-curvature-value')
+const innerSeamCurvatureSlider = requireElement<HTMLInputElement>('#innerSeamCurvature')
+const innerSeamCurvatureValue = requireElement<HTMLSpanElement>('#inner-seam-curvature-value')
 const pressureSlider = requireElement<HTMLInputElement>('#pressureSlider')
 const pressureValue = requireElement<HTMLSpanElement>('#pressure-value')
 const wireToggle = requireElement<HTMLInputElement>('#wireToggle')
@@ -258,7 +268,8 @@ let draggingHandle: HandleTarget | null = null
 let pendingHandleClick: PendingHandleClick | null = null
 let activePressInteraction: ActivePressInteraction | null = null
 let draggingPanel = false
-let seamCurvature = Math.max(1, Math.round(Number.parseFloat(seamCurvatureSlider.value) || 1))
+let outerSeamCurvature = Math.max(1, Math.round(Number.parseFloat(outerSeamCurvatureSlider.value) || 1))
+let innerSeamCurvature = Math.max(1, Math.round(Number.parseFloat(innerSeamCurvatureSlider.value) || 1))
 
 const CLICK_DRAG_THRESHOLD = 6
 const INTERNAL_SNAP_DISTANCE = 0.32
@@ -304,7 +315,11 @@ function updateRangeProgress(input: HTMLInputElement): void {
 }
 
 function getCurvedOutlinePoints(points: readonly OutlinePoint[], closed = true): THREE.Vector2[] {
-  return buildSubdividedPath(points, closed, seamCurvature)
+  return buildSubdividedPath(points, closed, outerSeamCurvature)
+}
+
+function getCurvedInternalSeamPoints(points: readonly OutlinePoint[], closed: boolean): THREE.Vector2[] {
+  return buildSubdividedPath(points, closed, innerSeamCurvature)
 }
 
 function buildLineGeometryFromVectors(points: readonly THREE.Vector2[]): THREE.BufferGeometry {
@@ -338,8 +353,12 @@ function rebuildInflatedSimulations(): void {
   pillowSimulations = closedOutlineRecords.map((record) => {
     const simulation = buildPillowFromOutline(
       cloneOutlinePoints(record.outline.points),
-      record.internalPaths.map((path) => cloneOutlinePoints(path.points)),
-      seamCurvature,
+      record.internalPaths.map((path) => ({
+        points: cloneOutlinePoints(path.points),
+        closed: path.closed,
+      })),
+      outerSeamCurvature,
+      innerSeamCurvature,
     )
     simulation.setWireframeVisible(showWireframe)
     scene.add(simulation.mesh)
@@ -393,6 +412,16 @@ function formatOutlineCount(count: number): string {
 
 function formatPillowCount(count: number): string {
   return `${count} pillow${count === 1 ? '' : 's'}`
+}
+
+function isTypingInUi(): boolean {
+  const activeElement = document.activeElement
+  return (
+    activeElement instanceof HTMLInputElement ||
+    activeElement instanceof HTMLButtonElement ||
+    activeElement instanceof HTMLSelectElement ||
+    activeElement instanceof HTMLTextAreaElement
+  )
 }
 
 function createPoint(position: THREE.Vector2): OutlinePoint {
@@ -451,7 +480,7 @@ function refreshOutlineState(): void {
         : ''
     statusText.textContent = activeOutline.error + readySuffix
   } else if (selectedOutline && hasInternalDraft) {
-    statusText.textContent = 'Drawing a chamber seam. Click inside the selected outline to add points. Click near the outer seam or an existing chamber seam to finish, or click the last chamber point again to finish it floating.'
+    statusText.textContent = 'Drawing a chamber seam. Click inside the selected outline to add points. Click the first chamber point to close a loop, click near the outer seam or an existing chamber seam to finish open, or press Enter to end the seam open.'
   } else if (selectedOutline) {
     statusText.textContent = 'Outline selected. Click inside it to draw a chamber seam. Click another closed outline to switch selection, or click empty ground to start a new outer outline.'
   } else if (invalidClosedOutline) {
@@ -498,7 +527,7 @@ function rebuildPreviewMeshes(): void {
       continue
     }
 
-    const shape = buildShape(record.outline.points, seamCurvature)
+    const shape = buildShape(record.outline.points, outerSeamCurvature)
     if (!shape) {
       continue
     }
@@ -566,10 +595,18 @@ function rebuildSeamLines(): void {
         continue
       }
 
-      const internalLine = new THREE.Line(
-        buildLineGeometryFromVectors(getOutlineVectors(internalPath.points)),
-        isSelected ? selectedInternalSeamMaterial : internalSeamMaterial,
+      const internalGeometry = buildLineGeometryFromVectors(
+        getCurvedInternalSeamPoints(internalPath.points, internalPath.closed),
       )
+      const internalLine = internalPath.closed
+        ? new THREE.LineLoop(
+            internalGeometry,
+            isSelected ? selectedInternalSeamMaterial : internalSeamMaterial,
+          )
+        : new THREE.Line(
+            internalGeometry,
+            isSelected ? selectedInternalSeamMaterial : internalSeamMaterial,
+          )
       seamGroup.add(internalLine)
     }
   }
@@ -585,7 +622,7 @@ function rebuildSeamLines(): void {
 
   if (internalPathDraft.length >= 2) {
     const line = new THREE.Line(
-      buildLineGeometryFromVectors(getOutlineVectors(internalPathDraft)),
+      buildLineGeometryFromVectors(getCurvedInternalSeamPoints(internalPathDraft, false)),
       internalDraftMaterial,
     )
     seamGroup.add(line)
@@ -595,7 +632,13 @@ function rebuildSeamLines(): void {
     const point = internalPathDraft[index]
     const marker = new THREE.Mesh(
       internalDraftPointGeometry,
-      makeHandleMaterial(index === internalPathDraft.length - 1 ? 0xe05a78 : 0xffc2cf),
+      makeHandleMaterial(
+        index === 0 && internalPathDraft.length >= 3
+          ? 0x9ef0b5
+          : index === internalPathDraft.length - 1
+            ? 0xe05a78
+            : 0xffc2cf,
+      ),
     )
     marker.position.set(point.position.x, 0, point.position.y)
     internalDraftPointGroup.add(marker)
@@ -770,31 +813,42 @@ function closeActiveOutline(): void {
   syncOutlineVisuals()
 }
 
-function finalizeInternalPath(record: OutlineRecord): void {
-  if (internalPathDraft.length < 2) {
-    return
+function finalizeInternalPath(record: OutlineRecord, closed: boolean): boolean {
+  if (internalPathDraft.length < (closed ? 3 : 2)) {
+    return false
   }
 
-  const span = internalPathDraft.reduce(
-    (maxDistance, point) =>
-      Math.max(maxDistance, point.position.distanceTo(internalPathDraft[0].position)),
-    0,
-  )
+  const nextPoints = cloneOutlinePoints(internalPathDraft)
 
-  if (span <= MIN_INTERNAL_SEGMENT_LENGTH) {
-    return
+  if (closed) {
+    const validation = validatePathVectors(getOutlineVectors(nextPoints), true)
+    if (!validation.valid) {
+      return false
+    }
+  } else {
+    const span = nextPoints.reduce(
+      (maxDistance, point) =>
+        Math.max(maxDistance, point.position.distanceTo(nextPoints[0].position)),
+      0,
+    )
+
+    if (span <= MIN_INTERNAL_SEGMENT_LENGTH) {
+      return false
+    }
   }
 
   record.internalPaths = [
     ...record.internalPaths,
     {
       id: nextInternalPathId,
-      points: cloneOutlinePoints(internalPathDraft),
+      points: nextPoints,
+      closed,
     },
   ]
   nextInternalPathId += 1
   internalPathDraft = []
   syncOutlineVisuals()
+  return true
 }
 
 function projectPointToSegment(
@@ -856,7 +910,14 @@ function getInternalSnapTarget(record: OutlineRecord, position: THREE.Vector2): 
   )
 
   for (const internalPath of record.internalPaths) {
-    const candidate = getSnapTargetForPath(internalPath.points, false, position)
+    const candidate = getSnapTargetForPath(
+      getCurvedInternalSeamPoints(internalPath.points, internalPath.closed).map((point, index) => ({
+        id: -(index + 1),
+        position: point,
+      })),
+      internalPath.closed,
+      position,
+    )
     if (!candidate) {
       continue
     }
@@ -871,18 +932,24 @@ function getInternalSnapTarget(record: OutlineRecord, position: THREE.Vector2): 
 
 function tryAddInternalSeamPoint(record: OutlineRecord, position: THREE.Vector2): boolean {
   const snappedTarget = getInternalSnapTarget(record, position)
-  const isInside = pointInOutline(position, record.outline.points)
+  const isInside = pointInOutline(position, getCurvedOutlinePoints(record.outline.points))
   const candidate = snappedTarget ? snappedTarget.position : position
 
   if (!isInside && !snappedTarget) {
     return false
   }
 
+  if (internalPathDraft.length >= 3) {
+    const firstPoint = internalPathDraft[0]
+    if (firstPoint.position.distanceTo(position) <= INTERNAL_FINISH_DISTANCE) {
+      return finalizeInternalPath(record, true)
+    }
+  }
+
   if (internalPathDraft.length >= 2) {
     const lastPoint = internalPathDraft[internalPathDraft.length - 1]
     if (lastPoint.position.distanceTo(position) <= INTERNAL_FINISH_DISTANCE) {
-      finalizeInternalPath(record)
-      return true
+      return finalizeInternalPath(record, false)
     }
   }
 
@@ -900,8 +967,7 @@ function tryAddInternalSeamPoint(record: OutlineRecord, position: THREE.Vector2)
   internalPathDraft = [...internalPathDraft, createPoint(candidate)]
 
   if (snappedTarget && internalPathDraft.length >= 2) {
-    finalizeInternalPath(record)
-    return true
+    return finalizeInternalPath(record, false)
   }
 
   syncOutlineVisuals()
@@ -946,8 +1012,12 @@ function toggleInflation(): void {
     pillowSimulations = closedOutlineRecords.map((record) => {
       const simulation = buildPillowFromOutline(
         cloneOutlinePoints(record.outline.points),
-        record.internalPaths.map((path) => cloneOutlinePoints(path.points)),
-        seamCurvature,
+        record.internalPaths.map((path) => ({
+          points: cloneOutlinePoints(path.points),
+          closed: path.closed,
+        })),
+        outerSeamCurvature,
+        innerSeamCurvature,
       )
       simulation.setWireframeVisible(showWireframe)
       scene.add(simulation.mesh)
@@ -1068,12 +1138,27 @@ undoButton.addEventListener('click', () => {
 inflateButton.addEventListener('click', toggleInflation)
 resetButton.addEventListener('click', handleReset)
 
-seamCurvatureSlider.addEventListener('input', () => {
-  const nextCurvature = Math.max(1, Math.round(Number.parseFloat(seamCurvatureSlider.value) || 1))
-  seamCurvature = nextCurvature
-  seamCurvatureSlider.value = `${nextCurvature}`
-  seamCurvatureValue.textContent = `${nextCurvature}`
-  updateRangeProgress(seamCurvatureSlider)
+outerSeamCurvatureSlider.addEventListener('input', () => {
+  const nextCurvature = Math.max(1, Math.round(Number.parseFloat(outerSeamCurvatureSlider.value) || 1))
+  outerSeamCurvature = nextCurvature
+  outerSeamCurvatureSlider.value = `${nextCurvature}`
+  outerSeamCurvatureValue.textContent = `${nextCurvature}`
+  updateRangeProgress(outerSeamCurvatureSlider)
+
+  if (pillowSimulations.length > 0) {
+    rebuildInflatedSimulations()
+    return
+  }
+
+  syncOutlineVisuals()
+})
+
+innerSeamCurvatureSlider.addEventListener('input', () => {
+  const nextCurvature = Math.max(1, Math.round(Number.parseFloat(innerSeamCurvatureSlider.value) || 1))
+  innerSeamCurvature = nextCurvature
+  innerSeamCurvatureSlider.value = `${nextCurvature}`
+  innerSeamCurvatureValue.textContent = `${nextCurvature}`
+  updateRangeProgress(innerSeamCurvatureSlider)
 
   if (pillowSimulations.length > 0) {
     rebuildInflatedSimulations()
@@ -1438,6 +1523,30 @@ window.addEventListener('pointercancel', (event) => {
   }
 })
 
+window.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' || event.repeat || isTypingInUi() || pillowSimulations.length > 0) {
+    return
+  }
+
+  const selectedOutline = getSelectedOutlineRecord()
+  if (selectedOutline && internalPathDraft.length > 0) {
+    event.preventDefault()
+    finalizeInternalPath(selectedOutline, false)
+    return
+  }
+
+  const activeOutline = getActiveOutline()
+  if (
+    activeOutline.points.length >= 3 &&
+    !activeOutline.closed &&
+    activeOutline.valid &&
+    internalPathDraft.length === 0
+  ) {
+    event.preventDefault()
+    closeActiveOutline()
+  }
+})
+
 window.addEventListener('resize', onResize)
 
 function onResize(): void {
@@ -1467,8 +1576,10 @@ function animate(): void {
 syncOutlineVisuals()
 onResize()
 bindSectionCollapses()
-seamCurvatureValue.textContent = `${seamCurvature}`
-updateRangeProgress(seamCurvatureSlider)
+outerSeamCurvatureValue.textContent = `${outerSeamCurvature}`
+innerSeamCurvatureValue.textContent = `${innerSeamCurvature}`
+updateRangeProgress(outerSeamCurvatureSlider)
+updateRangeProgress(innerSeamCurvatureSlider)
 requestAnimationFrame(() => {
   document.documentElement.classList.add('ui-ready')
 })
