@@ -258,10 +258,9 @@ renderer.shadowMap.enabled = true
 renderer.shadowMap.type = THREE.PCFSoftShadowMap
 
 const scene = new THREE.Scene()
-scene.background = new THREE.Color(0xe8edf8)
+scene.background = new THREE.Color(0x000000)
 const reflectionEnvironment = createStudioReflectionEnvironment(renderer)
 scene.environment = reflectionEnvironment.texture
-const VISIBLE_GROUND_OFFSET = -0.03
 const REFLECTION_ACCENT_INTENSITIES = {
   magenta: 6.2,
   cyan: 7.8,
@@ -329,19 +328,6 @@ const amberAccentLight = new THREE.PointLight(
 )
 amberAccentLight.position.set(7.8, 5.2, -4.8)
 scene.add(amberAccentLight)
-
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(40, 40),
-  new THREE.ShadowMaterial({ color: 0x718096, opacity: 0.12 }),
-)
-ground.rotation.x = -Math.PI / 2
-ground.position.y = VISIBLE_GROUND_OFFSET
-ground.receiveShadow = true
-scene.add(ground)
-
-const gridHelper = new THREE.GridHelper(40, 40, 0x8ea4b7, 0xc7d3de)
-gridHelper.position.y = VISIBLE_GROUND_OFFSET + 0.002
-scene.add(gridHelper)
 
 const seamGroup = new THREE.Group()
 seamGroup.position.y = 0.025
