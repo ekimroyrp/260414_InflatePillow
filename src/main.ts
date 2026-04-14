@@ -42,6 +42,14 @@ interface SnapTarget {
   distance: number
 }
 
+interface ActivePressInteraction {
+  pointerId: number
+  simulation: PillowSimulation
+  startedAt: number
+  startPoint: THREE.Vector3
+  maxTravel: number
+}
+
 type VertexFocusKey = 'selectedVertexId' | 'hoveredVertexId'
 
 document.title = '260414_InflatePillow'
@@ -74,7 +82,7 @@ app.innerHTML = `
         <input id="wireToggle" type="checkbox" checked />
       </label>
       <p id="statusText" class="status-text"></p>
-      <p class="hint-text">Left click adds outer corners. Click the first point to close an outline. Click a closed outline to select it, then click inside it to draw chamber seams. Click near the outer seam or an existing chamber seam to finish a chamber path. Right mouse drag orbits the camera. Middle mouse drag pans.</p>
+      <p class="hint-text">Left click adds outer corners. Click the first point to close an outline. Click a closed outline to select it, then click inside it to draw chamber seams. In inflate mode, left drag on a pillow presses it in and release lets it bounce with a ripple. A quick tap gives a sharper rebound. Right mouse drag orbits the camera. Middle mouse drag pans.</p>
     </section>
   </div>
 `
@@ -202,11 +210,14 @@ let selectedOutlineId: number | null = null
 let internalPathDraft: OutlinePoint[] = []
 let draggingHandle: HandleTarget | null = null
 let pendingHandleClick: PendingHandleClick | null = null
+let activePressInteraction: ActivePressInteraction | null = null
 
 const CLICK_DRAG_THRESHOLD = 6
 const INTERNAL_SNAP_DISTANCE = 0.32
 const INTERNAL_FINISH_DISTANCE = 0.2
 const MIN_INTERNAL_SEGMENT_LENGTH = 0.06
+const QUICK_TAP_DURATION_MS = 170
+const QUICK_TAP_TRAVEL = 0.32
 
 function createOutlineRecord(): OutlineRecord {
   return {
@@ -312,7 +323,7 @@ function refreshOutlineState(): void {
   pressureValue.textContent = getPressureValue().toFixed(2)
 
   if (pillowSimulations.length > 0 && hasActivatedInflation) {
-    statusText.textContent = `Pumping ${formatPillowCount(pillowSimulations.length)} toward ${getPressureValue().toFixed(2)} pressure. Lower the slider to deflate, or reset to edit the seams again.`
+    statusText.textContent = `Pumping ${formatPillowCount(pillowSimulations.length)} toward ${getPressureValue().toFixed(2)} pressure. Left drag presses a pillow in, release lets it ripple back, and a quick tap gives a stronger bounce.`
   } else if (hasOpenOuterDraft) {
     const readySuffix =
       closedOutlineCount > 0
@@ -548,6 +559,8 @@ function disposeSimulations(): void {
 }
 
 function resetToEditableOutlines(): void {
+  activePressInteraction?.simulation.endPress()
+  activePressInteraction = null
   disposeSimulations()
   hasActivatedInflation = false
   clearSelection()
@@ -591,6 +604,32 @@ function pickPreview(clientX: number, clientY: number): THREE.Intersection<THREE
   raycaster.setFromCamera(pointer, camera)
   const intersections = raycaster.intersectObjects(previewGroup.children, false)
   return intersections[0] ?? null
+}
+
+function findSimulationForObject(object: THREE.Object3D | null): PillowSimulation | null {
+  let current: THREE.Object3D | null = object
+
+  while (current) {
+    const simulation = current.userData.simulation as PillowSimulation | undefined
+    if (simulation) {
+      return simulation
+    }
+
+    current = current.parent
+  }
+
+  return null
+}
+
+function pickInflatedMesh(clientX: number, clientY: number): THREE.Intersection<THREE.Object3D> | null {
+  updatePointer(clientX, clientY)
+  raycaster.setFromCamera(pointer, camera)
+  const intersections = raycaster.intersectObjects(
+    pillowSimulations.map((simulation) => simulation.mesh),
+    true,
+  )
+
+  return intersections.find((intersection) => findSimulationForObject(intersection.object) !== null) ?? null
 }
 
 function getGroundIntersection(clientX: number, clientY: number): THREE.Vector3 | null {
@@ -915,6 +954,21 @@ renderer.domElement.addEventListener(
     }
 
     if (pillowSimulations.length > 0) {
+      const meshHit = pickInflatedMesh(event.clientX, event.clientY)
+      const simulation = meshHit ? findSimulationForObject(meshHit.object) : null
+      if (simulation) {
+        activePressInteraction = {
+          pointerId: event.pointerId,
+          simulation,
+          startedAt: performance.now(),
+          startPoint: meshHit!.point.clone(),
+          maxTravel: 0,
+        }
+        renderer.domElement.setPointerCapture(event.pointerId)
+        simulation.beginPress(meshHit!.point)
+      } else {
+        controls.enabled = true
+      }
       return
     }
 
@@ -981,6 +1035,23 @@ renderer.domElement.addEventListener(
 )
 
 renderer.domElement.addEventListener('pointermove', (event) => {
+  if (activePressInteraction) {
+    if (activePressInteraction.pointerId !== event.pointerId) {
+      return
+    }
+
+    const meshHit = pickInflatedMesh(event.clientX, event.clientY)
+    const simulation = meshHit ? findSimulationForObject(meshHit.object) : null
+    if (meshHit && simulation === activePressInteraction.simulation) {
+      activePressInteraction.maxTravel = Math.max(
+        activePressInteraction.maxTravel,
+        meshHit.point.distanceTo(activePressInteraction.startPoint),
+      )
+      activePressInteraction.simulation.updatePress(meshHit.point)
+    }
+    return
+  }
+
   if (pendingHandleClick && draggingHandle === null) {
     if (pendingHandleClick.pointerId !== event.pointerId) {
       return
@@ -1030,6 +1101,25 @@ renderer.domElement.addEventListener('pointermove', (event) => {
 })
 
 renderer.domElement.addEventListener('pointerup', (event) => {
+  if (activePressInteraction && activePressInteraction.pointerId === event.pointerId) {
+    if (renderer.domElement.hasPointerCapture(event.pointerId)) {
+      renderer.domElement.releasePointerCapture(event.pointerId)
+    }
+
+    const durationMs = performance.now() - activePressInteraction.startedAt
+    const tapDurationWeight = 1 - THREE.MathUtils.clamp(durationMs / QUICK_TAP_DURATION_MS, 0, 1)
+    const tapTravelWeight = 1 - THREE.MathUtils.clamp(activePressInteraction.maxTravel / QUICK_TAP_TRAVEL, 0, 1)
+    const quickTapStrength = tapDurationWeight * tapTravelWeight
+
+    activePressInteraction.simulation.endPress(
+      THREE.MathUtils.lerp(1, 2.4, quickTapStrength),
+      THREE.MathUtils.lerp(0, 0.68, quickTapStrength),
+    )
+    activePressInteraction = null
+    controls.enabled = true
+    return
+  }
+
   if (draggingHandle) {
     if (renderer.domElement.hasPointerCapture(event.pointerId)) {
       renderer.domElement.releasePointerCapture(event.pointerId)
@@ -1071,6 +1161,8 @@ renderer.domElement.addEventListener('pointerup', (event) => {
 })
 
 renderer.domElement.addEventListener('pointercancel', () => {
+  activePressInteraction?.simulation.endPress()
+  activePressInteraction = null
   draggingHandle = null
   pendingHandleClick = null
   setVertexFocus('selectedVertexId', null)

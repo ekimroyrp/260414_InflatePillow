@@ -15,6 +15,11 @@ interface PairConstraint {
   stiffness: number
 }
 
+interface PressState {
+  localPoint: THREE.Vector3
+  side: number
+}
+
 export interface SimulationParams {
   pressure: number
   pressureScale: number
@@ -27,6 +32,13 @@ export interface SimulationParams {
   profileStiffness: number
   maxBulgeScale: number
   maxDeltaTime: number
+  rippleStiffness: number
+  rippleDamping: number
+  rippleRestore: number
+  pressDepth: number
+  pressStiffness: number
+  releaseImpulse: number
+  interactionRadiusScale: number
 }
 
 export interface PillowSimulationState {
@@ -55,6 +67,13 @@ const DEFAULT_PARAMS: SimulationParams = {
   profileStiffness: 0.2,
   maxBulgeScale: 1.2,
   maxDeltaTime: 1 / 24,
+  rippleStiffness: 38,
+  rippleDamping: 7.6,
+  rippleRestore: 9.5,
+  pressDepth: 0.72,
+  pressStiffness: 56,
+  releaseImpulse: 2.6,
+  interactionRadiusScale: 1.6,
 }
 
 export class PillowSimulation {
@@ -66,13 +85,19 @@ export class PillowSimulation {
   private readonly previousPositions: THREE.Vector3[]
   private readonly pinnedMask: boolean[]
   private readonly pairConstraints: PairConstraint[]
+  private readonly rippleAdjacency: number[][]
+  private readonly rippleOffsets: number[]
+  private readonly rippleVelocities: number[]
   private readonly inflationWeights: number[]
   private readonly inflationSigns: number[]
   private readonly maxBulge: number
+  private readonly interactionRadius: number
   private readonly params: SimulationParams
+  private pressState: PressState | null = null
   private readonly tempVectorA = new THREE.Vector3()
   private readonly tempVectorB = new THREE.Vector3()
   private readonly tempVectorC = new THREE.Vector3()
+  private readonly tempVectorD = new THREE.Vector3()
 
   constructor(
     outline: readonly OutlinePoint[],
@@ -89,9 +114,17 @@ export class PillowSimulation {
 
     this.pinnedMask = simData.pinnedMask
     this.pairConstraints = simData.pairConstraints
+    this.rippleAdjacency = simData.adjacency
+    this.rippleOffsets = simData.positions.map(() => 0)
+    this.rippleVelocities = simData.positions.map(() => 0)
     this.inflationWeights = simData.inflationWeights
     this.inflationSigns = simData.inflationSigns
     this.maxBulge = simData.maxBulge
+    this.interactionRadius = THREE.MathUtils.clamp(
+      simData.maxBulge * this.params.interactionRadiusScale,
+      0.45,
+      2.1,
+    )
 
     const geometry = new THREE.BufferGeometry()
     const positionsArray = new Float32Array(simData.positions.length * 3)
@@ -140,6 +173,7 @@ export class PillowSimulation {
     this.mesh.add(this.wireOverlay)
     this.mesh.castShadow = true
     this.mesh.receiveShadow = true
+    this.mesh.userData.simulation = this
 
     this.syncGeometry()
   }
@@ -159,14 +193,75 @@ export class PillowSimulation {
   reset(): void {
     this.state.currentPressure = 0
     this.state.targetPressure = 0
+    this.pressState = null
 
     for (let index = 0; index < this.state.positions.length; index += 1) {
       this.state.positions[index].copy(this.state.basePositions[index])
       this.state.velocities[index].set(0, 0, 0)
       this.previousPositions[index].copy(this.state.basePositions[index])
+      this.rippleOffsets[index] = 0
+      this.rippleVelocities[index] = 0
     }
 
     this.syncGeometry()
+  }
+
+  beginPress(worldPoint: THREE.Vector3): void {
+    this.pressState = {
+      localPoint: this.mesh.worldToLocal(worldPoint.clone()),
+      side: this.mesh.worldToLocal(worldPoint.clone()).y >= 0 ? 1 : -1,
+    }
+  }
+
+  updatePress(worldPoint: THREE.Vector3): void {
+    if (!this.pressState) {
+      return
+    }
+
+    const localPoint = this.mesh.worldToLocal(worldPoint.clone())
+    this.pressState = {
+      localPoint,
+      side: localPoint.y >= 0 ? 1 : -1,
+    }
+  }
+
+  endPress(releaseBoost = 1, tapIndent = 0): void {
+    if (!this.pressState) {
+      return
+    }
+
+    const releasePoint = this.pressState.localPoint.clone()
+    const releaseSide = this.pressState.side
+    this.pressState = null
+
+    for (let index = 0; index < this.state.positions.length; index += 1) {
+      if (this.pinnedMask[index]) {
+        continue
+      }
+
+      const influence = this.getPressInfluence(index, releasePoint)
+      if (influence <= 0) {
+        continue
+      }
+
+      const sign = Math.sign(this.inflationSigns[index])
+      if (sign === 0) {
+        continue
+      }
+
+      const clickedSideBlend = THREE.MathUtils.lerp(0.12, 1, Math.max(0, sign * releaseSide))
+      if (tapIndent > 0) {
+        const tapOffset = -releaseSide * this.params.pressDepth * tapIndent * influence * clickedSideBlend
+        this.rippleOffsets[index] = THREE.MathUtils.lerp(this.rippleOffsets[index], tapOffset, 0.78)
+      }
+
+      this.rippleVelocities[index] +=
+        releaseSide *
+        this.params.releaseImpulse *
+        releaseBoost *
+        influence *
+        clickedSideBlend
+    }
   }
 
   setWireframeVisible(visible: boolean): void {
@@ -194,6 +289,7 @@ export class PillowSimulation {
 
     this.applyPressureForces(this.state.frontTriangles)
     this.applyPressureForces(this.state.backTriangles)
+    this.updateRippleField(deltaTime)
 
     const dampingFactor = Math.exp(-this.params.damping * deltaTime)
     for (let index = 0; index < this.state.positions.length; index += 1) {
@@ -282,15 +378,11 @@ export class PillowSimulation {
 
       const averageX = (front.x + back.x) * 0.5
       const averageZ = (front.z + back.z) * 0.5
-      const mirroredHeight = (front.y - back.y) * 0.5
 
       front.x = THREE.MathUtils.lerp(front.x, averageX, constraint.stiffness)
       front.z = THREE.MathUtils.lerp(front.z, averageZ, constraint.stiffness)
       back.x = THREE.MathUtils.lerp(back.x, averageX, constraint.stiffness)
       back.z = THREE.MathUtils.lerp(back.z, averageZ, constraint.stiffness)
-
-      front.y = THREE.MathUtils.lerp(front.y, mirroredHeight, constraint.stiffness)
-      back.y = THREE.MathUtils.lerp(back.y, -mirroredHeight, constraint.stiffness)
     }
   }
 
@@ -307,7 +399,7 @@ export class PillowSimulation {
         continue
       }
 
-      const desiredHeight = sign * weight * inflatedPressure * this.maxBulge
+      const desiredHeight = sign * weight * inflatedPressure * this.maxBulge + this.rippleOffsets[index]
       this.state.positions[index].y = THREE.MathUtils.lerp(
         this.state.positions[index].y,
         desiredHeight,
@@ -318,8 +410,82 @@ export class PillowSimulation {
 
   private solveSeamConstraints(): void {
     for (const seamIndex of this.state.seamIndices) {
+      this.rippleOffsets[seamIndex] = 0
+      this.rippleVelocities[seamIndex] = 0
       this.state.positions[seamIndex].copy(this.state.basePositions[seamIndex])
     }
+  }
+
+  private updateRippleField(deltaTime: number): void {
+    const accelerations = new Array<number>(this.rippleOffsets.length).fill(0)
+
+    for (let index = 0; index < this.rippleOffsets.length; index += 1) {
+      if (this.pinnedMask[index]) {
+        continue
+      }
+
+      const neighbors = this.rippleAdjacency[index]
+      if (neighbors.length > 0) {
+        const neighborAverage =
+          neighbors.reduce((sum, neighborIndex) => sum + this.rippleOffsets[neighborIndex], 0) /
+          neighbors.length
+        accelerations[index] +=
+          (neighborAverage - this.rippleOffsets[index]) * this.params.rippleStiffness
+      }
+
+      accelerations[index] += -this.rippleOffsets[index] * this.params.rippleRestore
+      accelerations[index] += -this.rippleVelocities[index] * this.params.rippleDamping
+
+      if (this.pressState) {
+        const targetOffset = this.getPressTargetOffset(index, this.pressState)
+        accelerations[index] +=
+          (targetOffset - this.rippleOffsets[index]) * this.params.pressStiffness
+      }
+    }
+
+    const maxOffset = this.maxBulge * 0.72
+    for (let index = 0; index < this.rippleOffsets.length; index += 1) {
+      if (this.pinnedMask[index]) {
+        continue
+      }
+
+      this.rippleVelocities[index] += accelerations[index] * deltaTime
+      this.rippleOffsets[index] = THREE.MathUtils.clamp(
+        this.rippleOffsets[index] + this.rippleVelocities[index] * deltaTime,
+        -maxOffset,
+        maxOffset,
+      )
+    }
+  }
+
+  private getPressTargetOffset(index: number, pressState: PressState): number {
+    const influence = this.getPressInfluence(index, pressState.localPoint)
+    if (influence <= 0) {
+      return 0
+    }
+
+    const sign = Math.sign(this.inflationSigns[index])
+    if (sign === 0) {
+      return 0
+    }
+
+    const clickedSideBlend = THREE.MathUtils.lerp(0.12, 1, Math.max(0, sign * pressState.side))
+    return -pressState.side * this.params.pressDepth * influence * clickedSideBlend
+  }
+
+  private getPressInfluence(index: number, localPoint: THREE.Vector3): number {
+    const position = this.state.positions[index]
+    this.tempVectorD.set(position.x, 0, position.z)
+    const planarDistance = this.tempVectorD.distanceToSquared(
+      this.tempVectorA.set(localPoint.x, 0, localPoint.z),
+    )
+    const normalizedDistance = Math.sqrt(planarDistance) / this.interactionRadius
+    if (normalizedDistance >= 1) {
+      return 0
+    }
+
+    const falloff = 1 - normalizedDistance
+    return falloff * falloff * (3 - 2 * falloff)
   }
 
   private syncGeometry(): void {
@@ -354,6 +520,7 @@ function createSimulationTopology(flatMesh: FlatMeshData, params: SimulationPara
   backTriangles: TriangleIndices[]
   pairConstraints: PairConstraint[]
   pinnedMask: boolean[]
+  adjacency: number[][]
   inflationWeights: number[]
   inflationSigns: number[]
   maxBulge: number
@@ -425,6 +592,7 @@ function createSimulationTopology(flatMesh: FlatMeshData, params: SimulationPara
   )
 
   const springs = buildSpringConstraints(frontTriangles, backTriangles, positions, params.stiffness)
+  const adjacency = buildVertexAdjacency(positions.length, [...frontTriangles, ...backTriangles])
 
   return {
     positions,
@@ -436,6 +604,7 @@ function createSimulationTopology(flatMesh: FlatMeshData, params: SimulationPara
     backTriangles,
     pairConstraints,
     pinnedMask,
+    adjacency,
     inflationWeights,
     inflationSigns,
     maxBulge,
