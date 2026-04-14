@@ -15,6 +15,7 @@
 - Adaptive, more uniform pillow triangulation
 - Custom paired-sheet mass-spring simulation with rounded inflation profiling
 - Toggleable mesh wire overlay for previewing the triangle layout
+- Toggleable Foil Material mode with reflective balloon shading and shared iridescence across foil and matte looks
 - DifferentialLayers-style floating control panel with Start/Pause, Pressure, and seam controls
 - Desktop-focused Three.js viewport with orbit, pan, and below-ground inspection
 
@@ -50,6 +51,7 @@ npm run build
 - `Inner Seam Curvature`: round and subdivide chamber seam paths used for preview and inflation
 - `Pressure Slider`: raise or lower the inflation target
 - `Mesh Wires`: show or hide the triangle wire overlay
+- `Foil Material`: toggle between reflective foil shading and the softer matte look
 - `Reset`: return to the editable flat outlines, or clear all drafts if no pillow exists
 - `Right Drag`: orbit the camera
 - `Middle Drag`: pan the camera

@@ -26,6 +26,25 @@ interface PressState {
   side: number
 }
 
+interface PillowMaterialStyle {
+  color: number
+  metalness: number
+  roughness: number
+  clearcoat: number
+  clearcoatRoughness: number
+  envMapIntensity: number
+  iridescence: number
+  iridescenceIOR: number
+  iridescenceThicknessRange: [number, number]
+  reflectivity: number
+  specularIntensity: number
+  sheen: number
+  sheenRoughness: number
+  sheenColor: number
+  eggIridescence: number
+  eggIridescenceFrequency: number
+}
+
 export interface SimulationParams {
   pressure: number
   pressureScale: number
@@ -92,7 +111,7 @@ const DEFAULT_PARAMS: SimulationParams = {
 
 const MIDPLANE_EPSILON = 0.0025
 const WIRE_SURFACE_OFFSET = 0.008
-const FOIL_MATERIAL_STYLE = {
+const FOIL_MATERIAL_STYLE: PillowMaterialStyle = {
   color: 0xf1f5ff,
   metalness: 1,
   roughness: 0.28,
@@ -107,16 +126,18 @@ const FOIL_MATERIAL_STYLE = {
   sheen: 0.1,
   sheenRoughness: 0.5,
   sheenColor: 0xe7eeff,
+  eggIridescence: 1.05,
+  eggIridescenceFrequency: 1.25,
 }
 
-const MATTE_MATERIAL_STYLE = {
+const MATTE_MATERIAL_STYLE: PillowMaterialStyle = {
   color: 0xc2d5f2,
   metalness: 0.04,
   roughness: 0.86,
   clearcoat: 0,
   clearcoatRoughness: 0,
   envMapIntensity: 0,
-  iridescence: 0,
+  iridescence: 0.18,
   iridescenceIOR: 1.22,
   iridescenceThicknessRange: [140, 460] as [number, number],
   reflectivity: 0.18,
@@ -124,12 +145,24 @@ const MATTE_MATERIAL_STYLE = {
   sheen: 0,
   sheenRoughness: 1,
   sheenColor: 0xffffff,
+  eggIridescence: 0.42,
+  eggIridescenceFrequency: 1.1,
 }
 
 export class PillowSimulation {
   readonly mesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshPhysicalMaterial>
   readonly state: PillowSimulationState
 
+  private readonly eggIridescenceState: {
+    strength: number
+    frequency: number
+    uniforms:
+      | null
+      | {
+          uEggIridescence: { value: number }
+          uEggIridescenceFrequency: { value: number }
+        }
+  }
   private readonly wireEdgePairs: number[]
   private readonly wireOverlay: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>
   private readonly forces: THREE.Vector3[]
@@ -208,6 +241,11 @@ export class PillowSimulation {
 
     this.forces = simData.positions.map(() => new THREE.Vector3())
     this.previousPositions = simData.positions.map((position) => position.clone())
+    this.eggIridescenceState = {
+      strength: FOIL_MATERIAL_STYLE.eggIridescence,
+      frequency: FOIL_MATERIAL_STYLE.eggIridescenceFrequency,
+      uniforms: null,
+    }
     this.wireEdgePairs = buildWireEdgePairs(combinedTriangles)
 
     this.mesh = new THREE.Mesh(
@@ -232,6 +270,7 @@ export class PillowSimulation {
         polygonOffsetUnits: 1,
       }),
     )
+    this.installEggIridescenceShader()
     const wireGeometry = new THREE.BufferGeometry()
     wireGeometry.setAttribute(
       'position',
@@ -360,7 +399,7 @@ export class PillowSimulation {
     this.wireOverlay.material.dispose()
   }
 
-  private applyMaterialStyle(style: typeof FOIL_MATERIAL_STYLE): void {
+  private applyMaterialStyle(style: PillowMaterialStyle): void {
     this.mesh.material.color.setHex(style.color)
     this.mesh.material.metalness = style.metalness
     this.mesh.material.roughness = style.roughness
@@ -375,7 +414,157 @@ export class PillowSimulation {
     this.mesh.material.sheen = style.sheen
     this.mesh.material.sheenRoughness = style.sheenRoughness
     this.mesh.material.sheenColor.setHex(style.sheenColor)
+    this.eggIridescenceState.strength = style.eggIridescence
+    this.eggIridescenceState.frequency = style.eggIridescenceFrequency
+    if (this.eggIridescenceState.uniforms) {
+      this.eggIridescenceState.uniforms.uEggIridescence.value = style.eggIridescence
+      this.eggIridescenceState.uniforms.uEggIridescenceFrequency.value =
+        style.eggIridescenceFrequency
+    }
     this.mesh.material.needsUpdate = true
+  }
+
+  private installEggIridescenceShader(): void {
+    this.mesh.material.customProgramCacheKey = () => 'pillow-egg-iridescence-v1'
+    this.mesh.material.onBeforeCompile = (shader) => {
+      const uniforms = {
+        uEggIridescence: { value: this.eggIridescenceState.strength },
+        uEggIridescenceFrequency: { value: this.eggIridescenceState.frequency },
+      }
+      this.eggIridescenceState.uniforms = uniforms
+      shader.uniforms.uEggIridescence = uniforms.uEggIridescence
+      shader.uniforms.uEggIridescenceFrequency = uniforms.uEggIridescenceFrequency
+
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+varying vec3 vEggIriWorldPosition;
+varying vec3 vEggIriWorldNormal;`,
+        )
+        .replace(
+          '#include <worldpos_vertex>',
+          `#include <worldpos_vertex>
+vEggIriWorldPosition = worldPosition.xyz;
+vEggIriWorldNormal = normalize( mat3( modelMatrix ) * normal );`,
+        )
+
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+uniform float uEggIridescence;
+uniform float uEggIridescenceFrequency;
+varying vec3 vEggIriWorldPosition;
+varying vec3 vEggIriWorldNormal;
+
+float eggSaturate01(float value) {
+  return clamp(value, 0.0, 1.0);
+}
+
+float eggHash13(vec3 p) {
+  p = fract(p * 0.1031);
+  p += dot(p, p.yzx + 19.19);
+  return fract((p.x + p.y) * p.z);
+}
+
+float eggSmoothNoise3(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  vec3 u = f * f * (3.0 - 2.0 * f);
+
+  float n000 = eggHash13(i + vec3(0.0, 0.0, 0.0));
+  float n100 = eggHash13(i + vec3(1.0, 0.0, 0.0));
+  float n010 = eggHash13(i + vec3(0.0, 1.0, 0.0));
+  float n110 = eggHash13(i + vec3(1.0, 1.0, 0.0));
+  float n001 = eggHash13(i + vec3(0.0, 0.0, 1.0));
+  float n101 = eggHash13(i + vec3(1.0, 0.0, 1.0));
+  float n011 = eggHash13(i + vec3(0.0, 1.0, 1.0));
+  float n111 = eggHash13(i + vec3(1.0, 1.0, 1.0));
+
+  float nx00 = mix(n000, n100, u.x);
+  float nx10 = mix(n010, n110, u.x);
+  float nx01 = mix(n001, n101, u.x);
+  float nx11 = mix(n011, n111, u.x);
+  float nxy0 = mix(nx00, nx10, u.y);
+  float nxy1 = mix(nx01, nx11, u.y);
+  return mix(nxy0, nxy1, u.z);
+}
+
+vec3 eggBismuthPalette(float t) {
+  t = fract(t);
+  vec3 c0 = vec3(1.00, 0.84, 0.20);
+  vec3 c1 = vec3(1.00, 0.33, 0.77);
+  vec3 c2 = vec3(0.18, 0.93, 1.00);
+  vec3 c3 = vec3(0.30, 1.00, 0.46);
+  if (t < 0.25) {
+    return mix(c0, c1, t * 4.0);
+  }
+  if (t < 0.50) {
+    return mix(c1, c2, (t - 0.25) * 4.0);
+  }
+  if (t < 0.75) {
+    return mix(c2, c3, (t - 0.50) * 4.0);
+  }
+  return mix(c3, c0, (t - 0.75) * 4.0);
+}
+
+vec3 applyEggIridescence(vec3 baseColor) {
+  float iriStrength = eggSaturate01(uEggIridescence);
+  if (iriStrength <= 0.0001) {
+    return baseColor;
+  }
+
+  vec3 n = normalize(vEggIriWorldNormal);
+  vec3 viewDir = normalize(cameraPosition - vEggIriWorldPosition);
+  float ndv = eggSaturate01(dot(n, viewDir));
+  float jitter = eggSmoothNoise3(vEggIriWorldPosition * 1.5 + vec3(31.4));
+  float broadNoise = eggSmoothNoise3(vEggIriWorldPosition * 0.48 + vec3(11.7));
+  float bandFreq = max(0.2, uEggIridescenceFrequency);
+  float facetBand =
+    (vEggIriWorldPosition.y * 1.8 + vEggIriWorldPosition.x * 0.42 - vEggIriWorldPosition.z * 0.31) * bandFreq;
+  float stepBand = (abs(vEggIriWorldPosition.x) + abs(vEggIriWorldPosition.z)) * 0.92;
+  float swirl =
+    0.5 +
+    0.5 *
+      sin(
+        dot(vEggIriWorldPosition, vec3(0.73, 0.51, -0.46)) * bandFreq * 1.25 +
+        broadNoise * 4.6 +
+        6.283
+      );
+  float thicknessT = fract(facetBand * 0.123 + stepBand * 0.081 + swirl * 0.39 + jitter * 0.27 + 5.7);
+  float thicknessNm = mix(120.0, 980.0, thicknessT);
+
+  vec3 wavelengths = vec3(680.0, 540.0, 440.0);
+  vec3 phase = (4.0 * 3.14159265 * 1.65 * thicknessNm * max(ndv, 0.08)) / wavelengths;
+  vec3 interference = 0.5 + 0.5 * cos(phase + vec3(0.0, 2.094, 4.188));
+
+  float hueSweep =
+    fract(
+      thicknessT * (0.55 + uEggIridescenceFrequency * 0.65) +
+      dot(n, vec3(0.23, 0.11, -0.37)) * 0.18
+    );
+  vec3 oxidePalette = eggBismuthPalette(hueSweep);
+  vec3 oxideColor = mix(interference, oxidePalette, 0.68);
+
+  float fresnel = pow(1.0 - ndv, 2.2);
+  float filmAmount = iriStrength * (0.48 + 0.52 * fresnel);
+  vec3 branchTint = mix(vec3(1.0), baseColor, 0.58);
+  vec3 metallicBase = vec3(0.92, 0.94, 0.98) * mix(vec3(1.0), branchTint, 0.26);
+  vec3 oxideTinted = mix(oxideColor, oxideColor * branchTint, 0.62);
+  vec3 blendTint = mix(metallicBase, oxideTinted, eggSaturate01(filmAmount * 0.78));
+  vec3 overlayTint = mix(vec3(1.0), blendTint, 0.62 * iriStrength);
+  vec3 iridescentBase = baseColor * overlayTint;
+  iridescentBase += oxideColor * fresnel * iriStrength * 0.22;
+  return mix(baseColor, iridescentBase, 0.85 * iriStrength);
+}`,
+        )
+        .replace(
+          '#include <color_fragment>',
+          `#include <color_fragment>
+diffuseColor.rgb = applyEggIridescence(diffuseColor.rgb);`,
+        )
+    }
   }
 
   private step(deltaTime: number): void {
