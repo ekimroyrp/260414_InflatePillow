@@ -7,15 +7,22 @@ import {
   buildShape,
   cloneOutlinePoints,
   createEditableOutline,
+  pointInOutline,
   type EditableOutline,
   type OutlinePoint,
   validateOutline,
 } from './geometry'
 import { buildPillowFromOutline, type PillowSimulation } from './pillowSimulation'
 
+interface InternalSeamRecord {
+  id: number
+  points: OutlinePoint[]
+}
+
 interface OutlineRecord {
   id: number
   outline: EditableOutline
+  internalPaths: InternalSeamRecord[]
 }
 
 interface HandleTarget {
@@ -28,6 +35,11 @@ interface PendingHandleClick extends HandleTarget {
   clientX: number
   clientY: number
   canClose: boolean
+}
+
+interface SnapTarget {
+  position: THREE.Vector2
+  distance: number
 }
 
 type VertexFocusKey = 'selectedVertexId' | 'hoveredVertexId'
@@ -44,7 +56,7 @@ app.innerHTML = `
     <section class="hud brand-panel">
       <p class="eyebrow">Three.js seam inflator</p>
       <h1>260414_InflatePillow</h1>
-      <p class="lede">Draw stitched outlines on the floor, refine the corners, then pump every closed seam into a two-sided pillow.</p>
+      <p class="lede">Draw stitched outlines on the floor, select a closed one to add chamber seams, then pump every closed seam into a two-sided pillow.</p>
     </section>
     <section class="hud control-panel">
       <div class="control-grid">
@@ -62,7 +74,7 @@ app.innerHTML = `
         <input id="wireToggle" type="checkbox" checked />
       </label>
       <p id="statusText" class="status-text"></p>
-      <p class="hint-text">Left click adds corners. Click the first point to close an outline, then click the ground to start another. Drag handles before inflation to reshape. Inflate pumps every closed outline. Right mouse drag orbits the camera. Middle mouse drag pans.</p>
+      <p class="hint-text">Left click adds outer corners. Click the first point to close an outline. Click a closed outline to select it, then click inside it to draw chamber seams. Click near the outer seam or an existing chamber seam to finish a chamber path. Right mouse drag orbits the camera. Middle mouse drag pans.</p>
     </section>
   </div>
 `
@@ -149,15 +161,15 @@ scene.add(seamGroup)
 const previewGroup = new THREE.Group()
 scene.add(previewGroup)
 
-const seamMaterial = new THREE.LineBasicMaterial({ color: 0xf3f7fb })
-const previewMaterial = new THREE.MeshStandardMaterial({
-  color: 0x8ecae6,
-  transparent: true,
-  opacity: 0.32,
-  roughness: 0.95,
-  metalness: 0.03,
-  side: THREE.DoubleSide,
-})
+const internalDraftPointGroup = new THREE.Group()
+internalDraftPointGroup.position.y = 0.055
+scene.add(internalDraftPointGroup)
+
+const outerSeamMaterial = new THREE.LineBasicMaterial({ color: 0xf3f7fb })
+const selectedOuterSeamMaterial = new THREE.LineBasicMaterial({ color: 0xffd47a })
+const internalSeamMaterial = new THREE.LineBasicMaterial({ color: 0x345a84 })
+const selectedInternalSeamMaterial = new THREE.LineBasicMaterial({ color: 0x173a5f })
+const internalDraftMaterial = new THREE.LineBasicMaterial({ color: 0xe05a78 })
 const previewWireMaterial = new THREE.MeshBasicMaterial({
   color: 0x37506c,
   wireframe: true,
@@ -169,6 +181,7 @@ const previewWireMaterial = new THREE.MeshBasicMaterial({
 let showWireframe = wireToggle.checked
 
 const handleGeometry = new THREE.CylinderGeometry(0.11, 0.11, 0.08, 20)
+const internalDraftPointGeometry = new THREE.SphereGeometry(0.08, 12, 10)
 const handleGroup = new THREE.Group()
 scene.add(handleGroup)
 
@@ -180,19 +193,26 @@ const clock = new THREE.Clock()
 
 let nextOutlineId = 1
 let nextPointId = 1
+let nextInternalPathId = 1
 let closedOutlineRecords: OutlineRecord[] = []
 let activeOutlineRecord = advanceOutlineRecord()
 let pillowSimulations: PillowSimulation[] = []
 let hasActivatedInflation = false
+let selectedOutlineId: number | null = null
+let internalPathDraft: OutlinePoint[] = []
 let draggingHandle: HandleTarget | null = null
 let pendingHandleClick: PendingHandleClick | null = null
 
 const CLICK_DRAG_THRESHOLD = 6
+const INTERNAL_SNAP_DISTANCE = 0.32
+const INTERNAL_FINISH_DISTANCE = 0.2
+const MIN_INTERNAL_SEGMENT_LENGTH = 0.06
 
 function createOutlineRecord(): OutlineRecord {
   return {
     id: nextOutlineId,
     outline: createEditableOutline(),
+    internalPaths: [],
   }
 }
 
@@ -220,6 +240,10 @@ function getAllOutlineRecords(): OutlineRecord[] {
 
 function getActiveOutline(): EditableOutline {
   return activeOutlineRecord.outline
+}
+
+function getSelectedOutlineRecord(): OutlineRecord | null {
+  return selectedOutlineId !== null ? findOutlineRecord(selectedOutlineId) : null
 }
 
 function findOutlineRecord(outlineId: number): OutlineRecord | null {
@@ -252,6 +276,20 @@ function formatPillowCount(count: number): string {
   return `${count} pillow${count === 1 ? '' : 's'}`
 }
 
+function createPoint(position: THREE.Vector2): OutlinePoint {
+  const point: OutlinePoint = {
+    id: nextPointId,
+    position: position.clone(),
+  }
+  nextPointId += 1
+  return point
+}
+
+function clearSelection(): void {
+  selectedOutlineId = null
+  internalPathDraft = []
+}
+
 function refreshOutlineState(): void {
   for (const record of getAllOutlineRecords()) {
     const validation = validateOutline(record.outline.points, record.outline.closed)
@@ -260,30 +298,46 @@ function refreshOutlineState(): void {
   }
 
   const activeOutline = getActiveOutline()
+  const selectedOutline = getSelectedOutlineRecord()
   const invalidClosedOutline = closedOutlineRecords.find((record) => !record.outline.valid)
   const closedOutlineCount = closedOutlineRecords.length
-  const hasOpenDraft = activeOutline.points.length > 0
-  const canInflate = hasOpenDraft === false && closedOutlineCount > 0 && !invalidClosedOutline
+  const hasOpenOuterDraft = activeOutline.points.length > 0
+  const hasInternalDraft = internalPathDraft.length > 0
+  const canInflate =
+    !hasOpenOuterDraft &&
+    !hasInternalDraft &&
+    closedOutlineCount > 0 &&
+    !invalidClosedOutline
 
   pressureValue.textContent = getPressureValue().toFixed(2)
 
   if (pillowSimulations.length > 0 && hasActivatedInflation) {
     statusText.textContent = `Pumping ${formatPillowCount(pillowSimulations.length)} toward ${getPressureValue().toFixed(2)} pressure. Lower the slider to deflate, or reset to edit the seams again.`
-  } else if (hasOpenDraft) {
+  } else if (hasOpenOuterDraft) {
     const readySuffix =
       closedOutlineCount > 0
         ? ` ${formatOutlineCount(closedOutlineCount)} ${closedOutlineCount === 1 ? 'is' : 'are'} waiting once you finish this draft.`
         : ''
     statusText.textContent = activeOutline.error + readySuffix
+  } else if (selectedOutline && hasInternalDraft) {
+    statusText.textContent = 'Drawing a chamber seam. Click inside the selected outline to add points. Click near the outer seam or an existing chamber seam to finish, or click the last chamber point again to finish it floating.'
+  } else if (selectedOutline) {
+    statusText.textContent = 'Outline selected. Click inside it to draw a chamber seam. Click another closed outline to switch selection, or click empty ground to start a new outer outline.'
   } else if (invalidClosedOutline) {
     statusText.textContent = `Adjust a closed outline before inflating all seams. ${invalidClosedOutline.outline.error}`
   } else if (closedOutlineCount > 0) {
-    statusText.textContent = `${formatOutlineCount(closedOutlineCount)} ready. Click the ground to start another outline, or inflate all of them.`
+    statusText.textContent = `${formatOutlineCount(closedOutlineCount)} ready. Click a closed outline to add chamber seams, click the ground to start another outline, or inflate all of them.`
   } else {
     statusText.textContent = activeOutline.error
   }
 
-  undoButton.disabled = pillowSimulations.length > 0 || activeOutline.points.length === 0
+  undoButton.disabled =
+    pillowSimulations.length > 0 ||
+    (
+      activeOutline.points.length === 0 &&
+      internalPathDraft.length === 0 &&
+      !(selectedOutline && selectedOutline.internalPaths.length > 0)
+    )
   inflateButton.disabled = !canInflate
   resetButton.disabled =
     pillowSimulations.length === 0 &&
@@ -294,6 +348,13 @@ function refreshOutlineState(): void {
 function clearPreviewMeshes(): void {
   for (const child of [...previewGroup.children]) {
     if (child instanceof THREE.Mesh) {
+      for (const overlay of child.children) {
+        if (overlay instanceof THREE.Mesh) {
+          ;(overlay.material as THREE.Material).dispose()
+        }
+      }
+
+      ;(child.material as THREE.Material).dispose()
       child.geometry.dispose()
     }
 
@@ -315,12 +376,24 @@ function rebuildPreviewMeshes(): void {
     }
 
     const geometry = new THREE.ShapeGeometry(shape)
-    const previewMesh = new THREE.Mesh(geometry, previewMaterial)
+    const isSelected = record.id === selectedOutlineId
+    const previewMesh = new THREE.Mesh(
+      geometry,
+      new THREE.MeshStandardMaterial({
+        color: isSelected ? 0xaed6ff : 0x8ecae6,
+        transparent: true,
+        opacity: isSelected ? 0.42 : 0.32,
+        roughness: 0.95,
+        metalness: 0.03,
+        side: THREE.DoubleSide,
+      }),
+    )
     previewMesh.rotation.x = Math.PI / 2
     previewMesh.position.y = 0.01
     previewMesh.receiveShadow = true
+    previewMesh.userData.outlineId = record.id
 
-    const previewWireOverlay = new THREE.Mesh(geometry, previewWireMaterial)
+    const previewWireOverlay = new THREE.Mesh(geometry, previewWireMaterial.clone())
     previewWireOverlay.visible = showWireframe
     previewWireOverlay.renderOrder = 2
     previewMesh.add(previewWireOverlay)
@@ -333,6 +406,14 @@ function clearSeamLines(): void {
     const line = child as THREE.Line
     line.geometry.dispose()
     seamGroup.remove(child)
+  }
+}
+
+function clearInternalDraftMarkers(): void {
+  for (const child of [...internalDraftPointGroup.children]) {
+    const mesh = child as THREE.Mesh
+    ;(mesh.material as THREE.Material).dispose()
+    internalDraftPointGroup.remove(child)
   }
 }
 
@@ -349,20 +430,52 @@ function buildLineGeometry(points: readonly OutlinePoint[]): THREE.BufferGeometr
 
 function rebuildSeamLines(): void {
   clearSeamLines()
+  clearInternalDraftMarkers()
 
   for (const record of closedOutlineRecords) {
     if (record.outline.points.length < 3) {
       continue
     }
 
-    const line = new THREE.LineLoop(buildLineGeometry(record.outline.points), seamMaterial)
-    seamGroup.add(line)
+    const isSelected = record.id === selectedOutlineId
+    const outerLine = new THREE.LineLoop(
+      buildLineGeometry(record.outline.points),
+      isSelected ? selectedOuterSeamMaterial : outerSeamMaterial,
+    )
+    seamGroup.add(outerLine)
+
+    for (const internalPath of record.internalPaths) {
+      if (internalPath.points.length < 2) {
+        continue
+      }
+
+      const internalLine = new THREE.Line(
+        buildLineGeometry(internalPath.points),
+        isSelected ? selectedInternalSeamMaterial : internalSeamMaterial,
+      )
+      seamGroup.add(internalLine)
+    }
   }
 
   const activeOutline = getActiveOutline()
   if (activeOutline.points.length >= 2) {
-    const line = new THREE.Line(buildLineGeometry(activeOutline.points), seamMaterial)
+    const line = new THREE.Line(buildLineGeometry(activeOutline.points), outerSeamMaterial)
     seamGroup.add(line)
+  }
+
+  if (internalPathDraft.length >= 2) {
+    const line = new THREE.Line(buildLineGeometry(internalPathDraft), internalDraftMaterial)
+    seamGroup.add(line)
+  }
+
+  for (let index = 0; index < internalPathDraft.length; index += 1) {
+    const point = internalPathDraft[index]
+    const marker = new THREE.Mesh(
+      internalDraftPointGeometry,
+      makeHandleMaterial(index === internalPathDraft.length - 1 ? 0xe05a78 : 0xffc2cf),
+    )
+    marker.position.set(point.position.x, 0, point.position.y)
+    internalDraftPointGroup.add(marker)
   }
 }
 
@@ -383,6 +496,7 @@ function rebuildHandles(): void {
 
   for (const record of getAllOutlineRecords()) {
     const isActiveOutline = record.id === activeOutlineRecord.id
+    const isSelectedOutline = record.id === selectedOutlineId
 
     for (const point of record.outline.points) {
       const isStartPoint = isActiveOutline && record.outline.points[0]?.id === point.id
@@ -400,7 +514,9 @@ function rebuildHandles(): void {
                 ? 0x3ca66b
                 : isInvalidClosedOutline
                   ? 0xaa5162
-                  : 0x14213d,
+                  : isSelectedOutline
+                    ? 0x24507f
+                    : 0x14213d,
       )
 
       const handle = new THREE.Mesh(handleGeometry, material)
@@ -434,17 +550,15 @@ function disposeSimulations(): void {
 function resetToEditableOutlines(): void {
   disposeSimulations()
   hasActivatedInflation = false
+  clearSelection()
   setVertexFocus('selectedVertexId', null)
   setVertexFocus('hoveredVertexId', null)
   syncOutlineVisuals()
 }
 
-function addPoint(position: THREE.Vector3): void {
-  getActiveOutline().points.push({
-    id: nextPointId,
-    position: new THREE.Vector2(position.x, position.z),
-  })
-  nextPointId += 1
+function addOuterPoint(position: THREE.Vector3): void {
+  clearSelection()
+  getActiveOutline().points.push(createPoint(new THREE.Vector2(position.x, position.z)))
   syncOutlineVisuals()
 }
 
@@ -472,11 +586,22 @@ function pickHandle(clientX: number, clientY: number): THREE.Intersection<THREE.
   return intersections[0] ?? null
 }
 
+function pickPreview(clientX: number, clientY: number): THREE.Intersection<THREE.Object3D> | null {
+  updatePointer(clientX, clientY)
+  raycaster.setFromCamera(pointer, camera)
+  const intersections = raycaster.intersectObjects(previewGroup.children, false)
+  return intersections[0] ?? null
+}
+
 function getGroundIntersection(clientX: number, clientY: number): THREE.Vector3 | null {
   updatePointer(clientX, clientY)
   raycaster.setFromCamera(pointer, camera)
   const point = raycaster.ray.intersectPlane(drawPlane, hitPoint)
   return point ? point.clone() : null
+}
+
+function toGroundVector(point: THREE.Vector3): THREE.Vector2 {
+  return new THREE.Vector2(point.x, point.z)
 }
 
 function closeActiveOutline(): void {
@@ -490,19 +615,167 @@ function closeActiveOutline(): void {
   activeOutline.hoveredVertexId = null
   closedOutlineRecords = [...closedOutlineRecords, activeOutlineRecord]
   activeOutlineRecord = advanceOutlineRecord()
+  clearSelection()
+  syncOutlineVisuals()
+}
+
+function finalizeInternalPath(record: OutlineRecord): void {
+  if (internalPathDraft.length < 2) {
+    return
+  }
+
+  const span = internalPathDraft.reduce(
+    (maxDistance, point) =>
+      Math.max(maxDistance, point.position.distanceTo(internalPathDraft[0].position)),
+    0,
+  )
+
+  if (span <= MIN_INTERNAL_SEGMENT_LENGTH) {
+    return
+  }
+
+  record.internalPaths = [
+    ...record.internalPaths,
+    {
+      id: nextInternalPathId,
+      points: cloneOutlinePoints(internalPathDraft),
+    },
+  ]
+  nextInternalPathId += 1
+  internalPathDraft = []
+  syncOutlineVisuals()
+}
+
+function projectPointToSegment(
+  point: THREE.Vector2,
+  start: THREE.Vector2,
+  end: THREE.Vector2,
+): THREE.Vector2 {
+  const segment = end.clone().sub(start)
+  const segmentLengthSquared = segment.lengthSq()
+
+  if (segmentLengthSquared < 1e-6) {
+    return start.clone()
+  }
+
+  const projection = THREE.MathUtils.clamp(
+    point.clone().sub(start).dot(segment) / segmentLengthSquared,
+    0,
+    1,
+  )
+
+  return start.clone().add(segment.multiplyScalar(projection))
+}
+
+function getSnapTargetForPath(
+  points: readonly OutlinePoint[],
+  closed: boolean,
+  position: THREE.Vector2,
+): SnapTarget | null {
+  if (points.length < 2) {
+    return null
+  }
+
+  const segmentCount = closed ? points.length : points.length - 1
+  let bestTarget: SnapTarget | null = null
+
+  for (let index = 0; index < segmentCount; index += 1) {
+    const start = points[index].position
+    const end = points[(index + 1) % points.length].position
+    const projected = projectPointToSegment(position, start, end)
+    const distance = projected.distanceTo(position)
+
+    if (!bestTarget || distance < bestTarget.distance) {
+      bestTarget = {
+        position: projected,
+        distance,
+      }
+    }
+  }
+
+  return bestTarget
+}
+
+function getInternalSnapTarget(record: OutlineRecord, position: THREE.Vector2): SnapTarget | null {
+  let bestTarget = getSnapTargetForPath(record.outline.points, true, position)
+
+  for (const internalPath of record.internalPaths) {
+    const candidate = getSnapTargetForPath(internalPath.points, false, position)
+    if (!candidate) {
+      continue
+    }
+
+    if (!bestTarget || candidate.distance < bestTarget.distance) {
+      bestTarget = candidate
+    }
+  }
+
+  return bestTarget && bestTarget.distance <= INTERNAL_SNAP_DISTANCE ? bestTarget : null
+}
+
+function tryAddInternalSeamPoint(record: OutlineRecord, position: THREE.Vector2): boolean {
+  const snappedTarget = getInternalSnapTarget(record, position)
+  const isInside = pointInOutline(position, record.outline.points)
+  const candidate = snappedTarget ? snappedTarget.position : position
+
+  if (!isInside && !snappedTarget) {
+    return false
+  }
+
+  if (internalPathDraft.length >= 2) {
+    const lastPoint = internalPathDraft[internalPathDraft.length - 1]
+    if (lastPoint.position.distanceTo(position) <= INTERNAL_FINISH_DISTANCE) {
+      finalizeInternalPath(record)
+      return true
+    }
+  }
+
+  if (internalPathDraft.length === 0) {
+    internalPathDraft = [createPoint(candidate)]
+    syncOutlineVisuals()
+    return true
+  }
+
+  const lastPoint = internalPathDraft[internalPathDraft.length - 1]
+  if (lastPoint.position.distanceTo(candidate) <= MIN_INTERNAL_SEGMENT_LENGTH) {
+    return false
+  }
+
+  internalPathDraft = [...internalPathDraft, createPoint(candidate)]
+
+  if (snappedTarget && internalPathDraft.length >= 2) {
+    finalizeInternalPath(record)
+    return true
+  }
+
+  syncOutlineVisuals()
+  return true
+}
+
+function selectOutline(outlineId: number | null): void {
+  selectedOutlineId = outlineId
+  internalPathDraft = []
   syncOutlineVisuals()
 }
 
 function inflateOutlines(): void {
   const activeOutline = getActiveOutline()
   const invalidClosedOutline = closedOutlineRecords.find((record) => !record.outline.valid)
-  if (activeOutline.points.length > 0 || closedOutlineRecords.length === 0 || invalidClosedOutline) {
+  if (
+    activeOutline.points.length > 0 ||
+    internalPathDraft.length > 0 ||
+    closedOutlineRecords.length === 0 ||
+    invalidClosedOutline
+  ) {
     return
   }
 
   if (pillowSimulations.length === 0) {
     pillowSimulations = closedOutlineRecords.map((record) => {
-      const simulation = buildPillowFromOutline(cloneOutlinePoints(record.outline.points))
+      const simulation = buildPillowFromOutline(
+        cloneOutlinePoints(record.outline.points),
+        record.internalPaths.map((path) => cloneOutlinePoints(path.points)),
+      )
       simulation.setWireframeVisible(showWireframe)
       scene.add(simulation.mesh)
       return simulation
@@ -528,22 +801,40 @@ function handleReset(): void {
 
   nextOutlineId = 1
   nextPointId = 1
+  nextInternalPathId = 1
   closedOutlineRecords = []
   activeOutlineRecord = advanceOutlineRecord()
   hasActivatedInflation = false
+  clearSelection()
   pendingHandleClick = null
   draggingHandle = null
   syncOutlineVisuals()
 }
 
 undoButton.addEventListener('click', () => {
-  const activeOutline = getActiveOutline()
-  if (pillowSimulations.length > 0 || activeOutline.points.length === 0) {
+  if (pillowSimulations.length > 0) {
     return
   }
 
-  activeOutline.points.pop()
-  syncOutlineVisuals()
+  const activeOutline = getActiveOutline()
+  const selectedOutline = getSelectedOutlineRecord()
+
+  if (activeOutline.points.length > 0) {
+    activeOutline.points.pop()
+    syncOutlineVisuals()
+    return
+  }
+
+  if (internalPathDraft.length > 0) {
+    internalPathDraft = internalPathDraft.slice(0, -1)
+    syncOutlineVisuals()
+    return
+  }
+
+  if (selectedOutline && selectedOutline.internalPaths.length > 0) {
+    selectedOutline.internalPaths = selectedOutline.internalPaths.slice(0, -1)
+    syncOutlineVisuals()
+  }
 })
 
 inflateButton.addEventListener('click', inflateOutlines)
@@ -627,10 +918,64 @@ renderer.domElement.addEventListener(
       return
     }
 
+    const previewHit = pickPreview(event.clientX, event.clientY)
+    const previewOutlineId = previewHit ? Number(previewHit.object.userData.outlineId) : null
     const point = getGroundIntersection(event.clientX, event.clientY)
-    if (point) {
-      addPoint(point)
+    if (!point) {
+      controls.enabled = true
+      return
     }
+
+    const activeOutline = getActiveOutline()
+    const selectedOutline = getSelectedOutlineRecord()
+
+    if (activeOutline.points.length > 0) {
+      addOuterPoint(point)
+      return
+    }
+
+    if (
+      selectedOutline &&
+      previewOutlineId !== null &&
+      previewOutlineId !== selectedOutline.id &&
+      internalPathDraft.length === 0
+    ) {
+      selectOutline(previewOutlineId)
+      return
+    }
+
+    if (selectedOutline) {
+      const groundVector = toGroundVector(point)
+      if (
+        previewOutlineId === selectedOutline.id ||
+        pointInOutline(groundVector, selectedOutline.outline.points) ||
+        getInternalSnapTarget(selectedOutline, groundVector)
+      ) {
+        if (tryAddInternalSeamPoint(selectedOutline, groundVector)) {
+          return
+        }
+      }
+
+      if (internalPathDraft.length === 0) {
+        if (previewOutlineId !== null) {
+          selectOutline(previewOutlineId)
+          return
+        }
+
+        clearSelection()
+        addOuterPoint(point)
+        return
+      }
+
+      return
+    }
+
+    if (previewOutlineId !== null) {
+      selectOutline(previewOutlineId)
+      return
+    }
+
+    addOuterPoint(point)
   },
   { capture: true },
 )

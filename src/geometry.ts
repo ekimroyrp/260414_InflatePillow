@@ -20,12 +20,19 @@ export interface OutlineValidation {
   error: string
 }
 
+export interface SampledSeamPath {
+  points: THREE.Vector2[]
+  closed: boolean
+}
+
 export type TriangleIndices = [number, number, number]
 
 export interface FlatMeshData {
   vertices: THREE.Vector2[]
   triangles: TriangleIndices[]
   boundaryVertexIndices: Set<number>
+  stitchedVertexIndices: Set<number>
+  seamPaths: SampledSeamPath[]
   area: number
 }
 
@@ -110,7 +117,22 @@ export function validateOutline(points: readonly OutlinePoint[], closed: boolean
   }
 }
 
-export function buildFlatMeshData(points: readonly OutlinePoint[]): FlatMeshData {
+export function pointInOutline(
+  point: THREE.Vector2,
+  outline: readonly OutlinePoint[] | readonly THREE.Vector2[],
+): boolean {
+  const contour =
+    outline.length > 0 && 'position' in outline[0]
+      ? getOutlineVectors(outline as readonly OutlinePoint[])
+      : (outline as readonly THREE.Vector2[]).map((candidate) => candidate.clone())
+
+  return pointInPolygonOrOnEdge(point, contour)
+}
+
+export function buildFlatMeshData(
+  points: readonly OutlinePoint[],
+  internalSeams: readonly (readonly OutlinePoint[])[] = [],
+): FlatMeshData {
   const contour = normalizeCounterClockwise(getOutlineVectors(points))
   const area = Math.abs(computeSignedArea(contour))
   const perimeter = computePerimeter(contour)
@@ -119,18 +141,45 @@ export function buildFlatMeshData(points: readonly OutlinePoint[]): FlatMeshData
     contour,
     THREE.MathUtils.clamp(Math.round(perimeter / targetSpacing), contour.length * 2, 240),
   )
-  const interiorPoints = generateInteriorPoints(contour, targetSpacing)
-  const vertices = [...sampledContour, ...interiorPoints]
+
+  const seamPaths: SampledSeamPath[] = [{ points: sampledContour, closed: true }]
+  for (const seam of internalSeams) {
+    if (seam.length < 2) {
+      continue
+    }
+
+    const sampledSeam = resampleOpenPath(
+      getOutlineVectors(seam),
+      THREE.MathUtils.clamp(targetSpacing, 0.12, 0.36),
+    )
+
+    if (sampledSeam.length >= 2) {
+      seamPaths.push({ points: sampledSeam, closed: false })
+    }
+  }
+
+  const vertices: THREE.Vector2[] = []
+  const boundaryVertexIndices = new Set<number>()
+  const stitchedVertexIndices = new Set<number>()
+
+  appendUniqueVertices(vertices, sampledContour, boundaryVertexIndices, stitchedVertexIndices)
+
+  for (let seamIndex = 1; seamIndex < seamPaths.length; seamIndex += 1) {
+    appendUniqueVertices(vertices, seamPaths[seamIndex].points, undefined, stitchedVertexIndices)
+  }
+
+  const interiorPoints = generateInteriorPoints(contour, seamPaths, targetSpacing)
+  appendUniqueVertices(vertices, interiorPoints)
+
   const delaunay = Delaunator.from(vertices, (point) => point.x, (point) => point.y)
   const triangles = buildUniformTriangles(vertices, sampledContour, delaunay.triangles)
-  const boundaryVertexIndices = new Set<number>(
-    sampledContour.map((_, index) => index),
-  )
 
   return {
     vertices,
     triangles,
     boundaryVertexIndices,
+    stitchedVertexIndices,
+    seamPaths,
     area,
   }
 }
@@ -153,6 +202,37 @@ function normalizeCounterClockwise(points: readonly THREE.Vector2[]): THREE.Vect
   }
 
   return contour
+}
+
+function appendUniqueVertices(
+  target: THREE.Vector2[],
+  candidates: readonly THREE.Vector2[],
+  boundaryVertexIndices?: Set<number>,
+  stitchedVertexIndices?: Set<number>,
+): void {
+  for (const candidate of candidates) {
+    const existingIndex = findExistingVertexIndex(target, candidate)
+    if (existingIndex >= 0) {
+      boundaryVertexIndices?.add(existingIndex)
+      stitchedVertexIndices?.add(existingIndex)
+      continue
+    }
+
+    const nextIndex = target.length
+    target.push(candidate.clone())
+    boundaryVertexIndices?.add(nextIndex)
+    stitchedVertexIndices?.add(nextIndex)
+  }
+}
+
+function findExistingVertexIndex(vertices: readonly THREE.Vector2[], candidate: THREE.Vector2): number {
+  for (let index = 0; index < vertices.length; index += 1) {
+    if (vertices[index].distanceToSquared(candidate) <= EPSILON * 16) {
+      return index
+    }
+  }
+
+  return -1
 }
 
 function resampleClosedContour(points: readonly THREE.Vector2[], desiredSegments: number): THREE.Vector2[] {
@@ -179,6 +259,35 @@ function resampleClosedContour(points: readonly THREE.Vector2[], desiredSegments
   return contour
 }
 
+function resampleOpenPath(points: readonly THREE.Vector2[], targetSpacing: number): THREE.Vector2[] {
+  const path: THREE.Vector2[] = []
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const start = points[index]
+    const end = points[index + 1]
+    const edgeLength = start.distanceTo(end)
+    const steps = Math.max(1, Math.ceil(edgeLength / targetSpacing))
+
+    for (let step = 0; step < steps; step += 1) {
+      const sample = new THREE.Vector2().lerpVectors(start, end, step / steps)
+      const previous = path[path.length - 1]
+      if (!previous || previous.distanceToSquared(sample) > EPSILON) {
+        path.push(sample)
+      }
+    }
+  }
+
+  const finalPoint = points[points.length - 1]
+  if (finalPoint) {
+    const previous = path[path.length - 1]
+    if (!previous || previous.distanceToSquared(finalPoint) > EPSILON) {
+      path.push(finalPoint.clone())
+    }
+  }
+
+  return path
+}
+
 function computePerimeter(points: readonly THREE.Vector2[]): number {
   let perimeter = 0
 
@@ -203,6 +312,7 @@ function computeTargetSpacing(area: number, perimeter: number): number {
 
 function generateInteriorPoints(
   contour: readonly THREE.Vector2[],
+  seamPaths: readonly SampledSeamPath[],
   spacing: number,
 ): THREE.Vector2[] {
   const bounds = new THREE.Box2().setFromPoints([...contour])
@@ -219,7 +329,7 @@ function generateInteriorPoints(
         continue
       }
 
-      if (distanceToContour(candidate, contour) < insetDistance) {
+      if (distanceToPathSet(candidate, seamPaths) < insetDistance) {
         continue
       }
 
@@ -330,12 +440,30 @@ function pointInPolygonOrOnEdge(point: THREE.Vector2, contour: readonly THREE.Ve
   return inside
 }
 
-function distanceToContour(point: THREE.Vector2, contour: readonly THREE.Vector2[]): number {
-  let minDistanceSquared = Number.POSITIVE_INFINITY
+function distanceToPathSet(point: THREE.Vector2, seamPaths: readonly SampledSeamPath[]): number {
+  let minDistance = Number.POSITIVE_INFINITY
 
-  for (let index = 0; index < contour.length; index += 1) {
-    const start = contour[index]
-    const end = contour[(index + 1) % contour.length]
+  for (const seamPath of seamPaths) {
+    minDistance = Math.min(
+      minDistance,
+      distanceToPolyline(point, seamPath.points, seamPath.closed),
+    )
+  }
+
+  return minDistance
+}
+
+function distanceToPolyline(
+  point: THREE.Vector2,
+  polyline: readonly THREE.Vector2[],
+  closed: boolean,
+): number {
+  let minDistanceSquared = Number.POSITIVE_INFINITY
+  const segmentCount = closed ? polyline.length : polyline.length - 1
+
+  for (let index = 0; index < segmentCount; index += 1) {
+    const start = polyline[index]
+    const end = polyline[(index + 1) % polyline.length]
     minDistanceSquared = Math.min(
       minDistanceSquared,
       distanceToSegmentSquared(point, start, end),
@@ -404,7 +532,10 @@ function segmentsShareEndpoint(
     return false
   }
 
-  return (firstIndex === 0 && secondIndex === pointCount - 1) || (secondIndex === 0 && firstIndex === pointCount - 1)
+  return (
+    (firstIndex === 0 && secondIndex === pointCount - 1) ||
+    (secondIndex === 0 && firstIndex === pointCount - 1)
+  )
 }
 
 function segmentsIntersect(

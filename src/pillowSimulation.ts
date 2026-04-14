@@ -74,13 +74,17 @@ export class PillowSimulation {
   private readonly tempVectorB = new THREE.Vector3()
   private readonly tempVectorC = new THREE.Vector3()
 
-  constructor(outline: readonly OutlinePoint[], params: Partial<SimulationParams> = {}) {
+  constructor(
+    outline: readonly OutlinePoint[],
+    internalSeams: readonly (readonly OutlinePoint[])[] = [],
+    params: Partial<SimulationParams> = {},
+  ) {
     this.params = {
       ...DEFAULT_PARAMS,
       ...params,
     }
 
-    const flatMesh = buildFlatMeshData(outline)
+    const flatMesh = buildFlatMeshData(outline, internalSeams)
     const simData = createSimulationTopology(flatMesh, this.params)
 
     this.pinnedMask = simData.pinnedMask
@@ -334,9 +338,10 @@ export class PillowSimulation {
 
 export function buildPillowFromOutline(
   outline: readonly OutlinePoint[],
+  internalSeams: readonly (readonly OutlinePoint[])[] = [],
   params?: Partial<SimulationParams>,
 ): PillowSimulation {
-  return new PillowSimulation(outline, params)
+  return new PillowSimulation(outline, internalSeams, params)
 }
 
 function createSimulationTopology(flatMesh: FlatMeshData, params: SimulationParams): {
@@ -364,14 +369,14 @@ function createSimulationTopology(flatMesh: FlatMeshData, params: SimulationPara
   const frontMap = new Array<number>(flatMesh.vertices.length)
   const backMap = new Array<number>(flatMesh.vertices.length)
   const contourWeights = buildContourWeights(flatMesh)
-  const maxBulge = THREE.MathUtils.clamp(contourWeights.maxDistance * params.maxBulgeScale, 0.35, 2.75)
+  const maxBulge = THREE.MathUtils.clamp(contourWeights.maxDistance * params.maxBulgeScale, 0.24, 2.75)
 
   for (let index = 0; index < flatMesh.vertices.length; index += 1) {
     const vertex = flatMesh.vertices[index]
     const basePosition = new THREE.Vector3(vertex.x, 0, vertex.y)
     const vertexWeight = contourWeights.weights[index]
 
-    if (flatMesh.boundaryVertexIndices.has(index)) {
+    if (flatMesh.stitchedVertexIndices.has(index)) {
       const seamIndex = positions.length
       positions.push(basePosition.clone())
       velocities.push(new THREE.Vector3())
@@ -438,15 +443,17 @@ function createSimulationTopology(flatMesh: FlatMeshData, params: SimulationPara
 }
 
 function buildContourWeights(flatMesh: FlatMeshData): { weights: number[]; maxDistance: number } {
-  const boundaryVertices = [...flatMesh.boundaryVertexIndices].map((index) => flatMesh.vertices[index])
   const rawDistances = flatMesh.vertices.map((vertex, index) => {
-    if (flatMesh.boundaryVertexIndices.has(index)) {
+    if (flatMesh.stitchedVertexIndices.has(index)) {
       return 0
     }
 
     let minDistance = Number.POSITIVE_INFINITY
-    for (const boundaryVertex of boundaryVertices) {
-      minDistance = Math.min(minDistance, vertex.distanceTo(boundaryVertex))
+    for (const seamPath of flatMesh.seamPaths) {
+      minDistance = Math.min(
+        minDistance,
+        distanceToSeamPath(vertex, seamPath.points, seamPath.closed),
+      )
     }
 
     return Number.isFinite(minDistance) ? minDistance : 0
@@ -463,7 +470,7 @@ function buildContourWeights(flatMesh: FlatMeshData): { weights: number[]; maxDi
     const nextWeights = smoothedWeights.slice()
 
     for (let index = 0; index < smoothedWeights.length; index += 1) {
-      if (flatMesh.boundaryVertexIndices.has(index)) {
+      if (flatMesh.stitchedVertexIndices.has(index)) {
         continue
       }
 
@@ -484,7 +491,7 @@ function buildContourWeights(flatMesh: FlatMeshData): { weights: number[]; maxDi
 
   const smoothedMax = Math.max(...smoothedWeights, 0.001)
   const weights = smoothedWeights.map((weight, index) => {
-    if (flatMesh.boundaryVertexIndices.has(index)) {
+    if (flatMesh.stitchedVertexIndices.has(index)) {
       return 0
     }
 
@@ -511,6 +518,47 @@ function buildVertexAdjacency(
   }
 
   return adjacency.map((neighbors) => [...neighbors])
+}
+
+function distanceToSeamPath(
+  point: THREE.Vector2,
+  seamPath: readonly THREE.Vector2[],
+  closed: boolean,
+): number {
+  let minDistanceSquared = Number.POSITIVE_INFINITY
+  const segmentCount = closed ? seamPath.length : seamPath.length - 1
+
+  for (let index = 0; index < segmentCount; index += 1) {
+    const start = seamPath[index]
+    const end = seamPath[(index + 1) % seamPath.length]
+    minDistanceSquared = Math.min(
+      minDistanceSquared,
+      distanceToSegmentSquared(point, start, end),
+    )
+  }
+
+  return Math.sqrt(minDistanceSquared)
+}
+
+function distanceToSegmentSquared(
+  point: THREE.Vector2,
+  start: THREE.Vector2,
+  end: THREE.Vector2,
+): number {
+  const segment = end.clone().sub(start)
+  const segmentLengthSquared = segment.lengthSq()
+
+  if (segmentLengthSquared < 1e-6) {
+    return point.distanceToSquared(start)
+  }
+
+  const projection = THREE.MathUtils.clamp(
+    point.clone().sub(start).dot(segment) / segmentLengthSquared,
+    0,
+    1,
+  )
+  const closestPoint = start.clone().add(segment.multiplyScalar(projection))
+  return point.distanceToSquared(closestPoint)
 }
 
 function applyInflationRamp(normalizedDistance: number): number {
