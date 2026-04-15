@@ -9,6 +9,7 @@
 - Selectable closed outlines with internal chamber seam drawing
 - Outer Seam Curvature slider that rounds and subdivides the stitched outline used for inflation
 - Inner Seam Curvature slider that rounds and subdivides chamber seams independently
+- Inner seam draft markers with close-loop hover feedback on the first point
 - Vertex handle editing before inflation
 - Closed-outline validation with self-intersection rejection
 - Pressure-driven pillow inflation and deflation across all closed seams
@@ -16,6 +17,9 @@
 - Custom paired-sheet mass-spring simulation with rounded inflation profiling
 - Toggleable mesh wire overlay for previewing the triangle layout
 - Toggleable Foil Material mode with reflective balloon shading and shared iridescence across foil and matte looks
+- Display section toggles for seam curves and the imported base grid
+- Export section for OBJ, GLB, and screenshot output
+- Undo/redo controls with keyboard shortcuts
 - DifferentialLayers-style floating control panel with Start/Pause, Pressure, and seam controls
 - Desktop-focused Three.js viewport with orbit, pan, and below-ground inspection
 
@@ -44,14 +48,19 @@ npm run build
 - `Left Click Near Outer or Existing Chamber Seam`: finish the current chamber seam open
 - `Enter` while drawing a chamber seam: end the current chamber seam open
 - `Left Drag on Handle`: move an existing corner before inflation
-- `Undo`: remove the last unclosed point
+- `Undo` / `Redo`: step backward or forward through outline and seam editing
+- `Ctrl+Z`: undo
+- `Ctrl+Y`: redo
 - `Start`: build pillow meshes for every closed outline and start pumping toward the slider target
 - `Pause`: pause the running inflation state
 - `Outer Seam Curvature`: round and subdivide the outer seam path used for preview and inflation
 - `Inner Seam Curvature`: round and subdivide chamber seam paths used for preview and inflation
 - `Pressure Slider`: raise or lower the inflation target
+- `Seam Curves`: show or hide the seam and draft seam overlays
+- `Base Grid`: show or hide the DifferentialLayers-style ground grid
 - `Mesh Wires`: show or hide the triangle wire overlay
 - `Foil Material`: toggle between reflective foil shading and the softer matte look
+- `Export OBJ` / `Export GLB` / `Export Screenshot`: save the current pillow geometry or viewport image
 - `Reset`: return to the editable flat outlines, or clear all drafts if no pillow exists
 - `Right Drag`: orbit the camera
 - `Middle Drag`: pan the camera
