@@ -105,6 +105,18 @@ html:not(.ui-ready) #ui-panel {
   display: none;
 }
 
+.control-hint {
+  margin: 0;
+  padding: 0;
+  font-size: 0.73rem;
+  letter-spacing: 0.01em;
+  color: var(--text-muted);
+}
+
+.seam-hints {
+  line-height: 1.45;
+}
+
 .collapse-button {
   position: absolute;
   left: 50%;
@@ -263,6 +275,7 @@ input[type="range"]:focus-visible,
 }
 
 #pressure-value,
+#subdivision-value,
 #outer-seam-curvature-value,
 #inner-seam-curvature-value {
   min-width: 8ch;

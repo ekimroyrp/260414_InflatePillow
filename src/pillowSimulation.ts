@@ -45,6 +45,20 @@ interface PillowMaterialStyle {
   eggIridescenceFrequency: number
 }
 
+interface VertexStencil {
+  indices: number[]
+  weights: number[]
+}
+
+interface RenderTopology {
+  vertexStencils: VertexStencil[]
+  triangles: TriangleIndices[]
+  indices: number[]
+  wireEdgePairs: number[]
+  creaseVertices: boolean[]
+  creaseEdges: Set<string>
+}
+
 export interface SimulationParams {
   pressure: number
   pressureScale: number
@@ -153,6 +167,7 @@ export class PillowSimulation {
   readonly mesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshPhysicalMaterial>
   readonly state: PillowSimulationState
 
+  private displaySubdivisionLevel: number
   private readonly eggIridescenceState: {
     strength: number
     frequency: number
@@ -163,8 +178,10 @@ export class PillowSimulation {
           uEggIridescenceFrequency: { value: number }
         }
   }
-  private readonly wireEdgePairs: number[]
+  private readonly renderTopologyCache = new Map<number, RenderTopology>()
+  private wireEdgePairs: number[] = []
   private readonly wireOverlay: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>
+  private readonly coarseRenderTopology: RenderTopology
   private readonly forces: THREE.Vector3[]
   private readonly previousPositions: THREE.Vector3[]
   private readonly pinnedMask: boolean[]
@@ -188,6 +205,7 @@ export class PillowSimulation {
     internalSeams: readonly InternalSeamInput[] = [],
     outerSeamCurvature = 1,
     innerSeamCurvature = 1,
+    displaySubdivisionLevel = 0,
     params: Partial<SimulationParams> = {},
   ) {
     this.params = {
@@ -217,13 +235,10 @@ export class PillowSimulation {
       2.1,
     )
 
-    const geometry = new THREE.BufferGeometry()
-    const positionsArray = new Float32Array(simData.positions.length * 3)
     const combinedTriangles = [...simData.frontTriangles, ...simData.backTriangles]
-    const indices = combinedTriangles.flat()
-
-    geometry.setAttribute('position', new THREE.BufferAttribute(positionsArray, 3))
-    geometry.setIndex(indices)
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3))
+    geometry.setIndex([])
 
     this.state = {
       currentPressure: this.params.pressure,
@@ -241,12 +256,18 @@ export class PillowSimulation {
 
     this.forces = simData.positions.map(() => new THREE.Vector3())
     this.previousPositions = simData.positions.map((position) => position.clone())
+    this.displaySubdivisionLevel = Math.max(0, Math.round(displaySubdivisionLevel))
     this.eggIridescenceState = {
       strength: FOIL_MATERIAL_STYLE.eggIridescence,
       frequency: FOIL_MATERIAL_STYLE.eggIridescenceFrequency,
       uniforms: null,
     }
-    this.wireEdgePairs = buildWireEdgePairs(combinedTriangles)
+    this.coarseRenderTopology = buildBaseRenderTopology(
+      simData.positions.length,
+      combinedTriangles,
+      new Set(simData.seamIndices),
+    )
+    this.renderTopologyCache.set(0, this.coarseRenderTopology)
 
     this.mesh = new THREE.Mesh(
       geometry,
@@ -274,7 +295,7 @@ export class PillowSimulation {
     const wireGeometry = new THREE.BufferGeometry()
     wireGeometry.setAttribute(
       'position',
-      new THREE.BufferAttribute(new Float32Array(this.wireEdgePairs.length * 3), 3),
+      new THREE.BufferAttribute(new Float32Array(0), 3),
     )
 
     this.wireOverlay = new THREE.LineSegments(
@@ -295,6 +316,7 @@ export class PillowSimulation {
     this.mesh.receiveShadow = false
     this.mesh.userData.simulation = this
 
+    this.rebuildRenderGeometry()
     this.syncGeometry()
   }
 
@@ -386,6 +408,17 @@ export class PillowSimulation {
 
   setWireframeVisible(visible: boolean): void {
     this.wireOverlay.visible = visible
+  }
+
+  setSubdivisionLevel(level: number): void {
+    const nextLevel = Math.max(0, Math.round(level))
+    if (this.displaySubdivisionLevel === nextLevel) {
+      return
+    }
+
+    this.displaySubdivisionLevel = nextLevel
+    this.rebuildRenderGeometry()
+    this.syncGeometry()
   }
 
   setReflectionEnabled(enabled: boolean): void {
@@ -565,6 +598,46 @@ vec3 applyEggIridescence(vec3 baseColor) {
 diffuseColor.rgb = applyEggIridescence(diffuseColor.rgb);`,
         )
     }
+  }
+
+  private getRenderTopology(level: number): RenderTopology {
+    const targetLevel = Math.max(0, Math.round(level))
+    if (this.renderTopologyCache.has(targetLevel)) {
+      return this.renderTopologyCache.get(targetLevel)!
+    }
+
+    for (let currentLevel = 1; currentLevel <= targetLevel; currentLevel += 1) {
+      if (this.renderTopologyCache.has(currentLevel)) {
+        continue
+      }
+
+      const previousLevel = this.renderTopologyCache.get(currentLevel - 1)
+      if (!previousLevel) {
+        throw new Error(`Missing subdivision topology for level ${currentLevel - 1}.`)
+      }
+
+      let nextLevelTopology = subdivideRenderTopology(previousLevel)
+      nextLevelTopology = smoothRenderTopology(nextLevelTopology, currentLevel, 0.18)
+      this.renderTopologyCache.set(currentLevel, nextLevelTopology)
+    }
+
+    return this.renderTopologyCache.get(targetLevel)!
+  }
+
+  private rebuildRenderGeometry(): void {
+    const topology = this.getRenderTopology(this.displaySubdivisionLevel)
+    this.wireEdgePairs = topology.wireEdgePairs
+    this.state.geometry.setAttribute(
+      'position',
+      new THREE.BufferAttribute(new Float32Array(topology.vertexStencils.length * 3), 3),
+    )
+    this.state.geometry.setIndex(topology.indices)
+    this.state.geometry.deleteAttribute('normal')
+
+    this.wireOverlay.geometry.setAttribute(
+      'position',
+      new THREE.BufferAttribute(new Float32Array(this.wireEdgePairs.length * 3), 3),
+    )
   }
 
   private step(deltaTime: number): void {
@@ -882,11 +955,25 @@ diffuseColor.rgb = applyEggIridescence(diffuseColor.rgb);`,
   }
 
   private syncGeometry(): void {
+    const topology = this.getRenderTopology(this.displaySubdivisionLevel)
     const positionAttribute = this.state.geometry.getAttribute('position') as THREE.BufferAttribute
 
-    for (let index = 0; index < this.state.positions.length; index += 1) {
-      const position = this.state.positions[index]
-      positionAttribute.setXYZ(index, position.x, position.y, position.z)
+    for (let index = 0; index < topology.vertexStencils.length; index += 1) {
+      const stencil = topology.vertexStencils[index]
+      let x = 0
+      let y = 0
+      let z = 0
+
+      for (let weightIndex = 0; weightIndex < stencil.indices.length; weightIndex += 1) {
+        const sourceIndex = stencil.indices[weightIndex]
+        const sourcePosition = this.state.positions[sourceIndex]
+        const weight = stencil.weights[weightIndex]
+        x += sourcePosition.x * weight
+        y += sourcePosition.y * weight
+        z += sourcePosition.z * weight
+      }
+
+      positionAttribute.setXYZ(index, x, y, z)
     }
 
     positionAttribute.needsUpdate = true
@@ -898,16 +985,18 @@ diffuseColor.rgb = applyEggIridescence(diffuseColor.rgb);`,
 
     for (let slot = 0; slot < this.wireEdgePairs.length; slot += 1) {
       const vertexIndex = this.wireEdgePairs[slot]
-      const position = this.state.positions[vertexIndex]
+      const positionX = positionAttribute.getX(vertexIndex)
+      const positionY = positionAttribute.getY(vertexIndex)
+      const positionZ = positionAttribute.getZ(vertexIndex)
       const normalX = normalAttribute.getX(vertexIndex)
       const normalY = normalAttribute.getY(vertexIndex)
       const normalZ = normalAttribute.getZ(vertexIndex)
 
       wirePositionAttribute.setXYZ(
         slot,
-        position.x + normalX * WIRE_SURFACE_OFFSET,
-        position.y + normalY * WIRE_SURFACE_OFFSET,
-        position.z + normalZ * WIRE_SURFACE_OFFSET,
+        positionX + normalX * WIRE_SURFACE_OFFSET,
+        positionY + normalY * WIRE_SURFACE_OFFSET,
+        positionZ + normalZ * WIRE_SURFACE_OFFSET,
       )
     }
 
@@ -921,6 +1010,7 @@ export function buildPillowFromOutline(
   internalSeams: readonly InternalSeamInput[] = [],
   outerSeamCurvature = 1,
   innerSeamCurvature = 1,
+  displaySubdivisionLevel = 0,
   params?: Partial<SimulationParams>,
 ): PillowSimulation {
   return new PillowSimulation(
@@ -928,6 +1018,7 @@ export function buildPillowFromOutline(
     internalSeams,
     outerSeamCurvature,
     innerSeamCurvature,
+    displaySubdivisionLevel,
     params,
   )
 }
@@ -1252,4 +1343,312 @@ function addEdge(
     restLength: positions[indexA].distanceTo(positions[indexB]),
     stiffness,
   })
+}
+
+function makeEdgeKey(indexA: number, indexB: number): string {
+  return indexA < indexB ? `${indexA}:${indexB}` : `${indexB}:${indexA}`
+}
+
+function cloneVertexStencil(stencil: VertexStencil): VertexStencil {
+  return {
+    indices: [...stencil.indices],
+    weights: [...stencil.weights],
+  }
+}
+
+function buildBaseRenderTopology(
+  vertexCount: number,
+  triangles: readonly TriangleIndices[],
+  creaseVertexSet: ReadonlySet<number>,
+): RenderTopology {
+  const nextTriangles = triangles.map(
+    ([indexA, indexB, indexC]) => [indexA, indexB, indexC] satisfies TriangleIndices,
+  )
+  const creaseVertices = Array.from({ length: vertexCount }, (_, index) => creaseVertexSet.has(index))
+  const creaseEdges = new Set<string>()
+
+  for (const [indexA, indexB, indexC] of nextTriangles) {
+    if (creaseVertices[indexA] && creaseVertices[indexB]) {
+      creaseEdges.add(makeEdgeKey(indexA, indexB))
+    }
+    if (creaseVertices[indexB] && creaseVertices[indexC]) {
+      creaseEdges.add(makeEdgeKey(indexB, indexC))
+    }
+    if (creaseVertices[indexC] && creaseVertices[indexA]) {
+      creaseEdges.add(makeEdgeKey(indexC, indexA))
+    }
+  }
+
+  return {
+    vertexStencils: Array.from({ length: vertexCount }, (_, index) => ({
+      indices: [index],
+      weights: [1],
+    })),
+    triangles: nextTriangles,
+    indices: nextTriangles.flat(),
+    wireEdgePairs: buildWireEdgePairs(nextTriangles),
+    creaseVertices,
+    creaseEdges,
+  }
+}
+
+function buildTopologyAdjacency(
+  triangles: readonly TriangleIndices[],
+  vertexCount: number,
+): number[][] {
+  const adjacency = Array.from({ length: vertexCount }, () => new Set<number>())
+
+  for (const [indexA, indexB, indexC] of triangles) {
+    adjacency[indexA].add(indexB)
+    adjacency[indexA].add(indexC)
+    adjacency[indexB].add(indexA)
+    adjacency[indexB].add(indexC)
+    adjacency[indexC].add(indexA)
+    adjacency[indexC].add(indexB)
+  }
+
+  return adjacency.map((neighbors) => [...neighbors])
+}
+
+function combineVertexStencils(
+  entries: readonly { stencil: VertexStencil; weight: number }[],
+): VertexStencil {
+  const combinedWeights = new Map<number, number>()
+
+  for (const entry of entries) {
+    if (Math.abs(entry.weight) < 1e-8) {
+      continue
+    }
+
+    for (let index = 0; index < entry.stencil.indices.length; index += 1) {
+      const sourceIndex = entry.stencil.indices[index]
+      const sourceWeight = entry.stencil.weights[index] * entry.weight
+      combinedWeights.set(
+        sourceIndex,
+        (combinedWeights.get(sourceIndex) ?? 0) + sourceWeight,
+      )
+    }
+  }
+
+  const filteredEntries = [...combinedWeights.entries()]
+    .filter(([, weight]) => Math.abs(weight) > 1e-8)
+    .sort(([indexA], [indexB]) => indexA - indexB)
+
+  const totalWeight = filteredEntries.reduce((sum, [, weight]) => sum + weight, 0)
+  if (filteredEntries.length === 0 || Math.abs(totalWeight) < 1e-8) {
+    return {
+      indices: [],
+      weights: [],
+    }
+  }
+
+  return {
+    indices: filteredEntries.map(([index]) => index),
+    weights: filteredEntries.map(([, weight]) => weight / totalWeight),
+  }
+}
+
+function smoothRenderTopology(
+  topology: RenderTopology,
+  passes: number,
+  lambda: number,
+): RenderTopology {
+  if (passes <= 0 || lambda <= 0) {
+    return topology
+  }
+
+  const adjacency = buildTopologyAdjacency(
+    topology.triangles,
+    topology.vertexStencils.length,
+  )
+  let vertexStencils = topology.vertexStencils.map(cloneVertexStencil)
+
+  for (let pass = 0; pass < passes; pass += 1) {
+    const nextStencils = vertexStencils.map(cloneVertexStencil)
+
+    for (let index = 0; index < vertexStencils.length; index += 1) {
+      if (topology.creaseVertices[index]) {
+        continue
+      }
+
+      const neighbors = adjacency[index]
+      if (neighbors.length === 0) {
+        continue
+      }
+
+      const neighborWeight = 1 / neighbors.length
+      const neighborAverage = combineVertexStencils(
+        neighbors.map((neighborIndex) => ({
+          stencil: vertexStencils[neighborIndex],
+          weight: neighborWeight,
+        })),
+      )
+
+      nextStencils[index] = combineVertexStencils([
+        { stencil: vertexStencils[index], weight: 1 - lambda },
+        { stencil: neighborAverage, weight: lambda },
+      ])
+    }
+
+    vertexStencils = nextStencils
+  }
+
+  return {
+    vertexStencils,
+    triangles: topology.triangles.map(
+      ([indexA, indexB, indexC]) => [indexA, indexB, indexC] satisfies TriangleIndices,
+    ),
+    indices: [...topology.indices],
+    wireEdgePairs: [...topology.wireEdgePairs],
+    creaseVertices: [...topology.creaseVertices],
+    creaseEdges: new Set(topology.creaseEdges),
+  }
+}
+
+function subdivideRenderTopology(topology: RenderTopology): RenderTopology {
+  const vertexCount = topology.vertexStencils.length
+  const adjacency = buildTopologyAdjacency(topology.triangles, vertexCount)
+  const edgeOpposites = new Map<string, number[]>()
+  const edgeEndpoints = new Map<string, [number, number]>()
+  const creaseNeighbors = Array.from({ length: vertexCount }, () => new Set<number>())
+
+  const registerEdge = (indexA: number, indexB: number, oppositeIndex: number): void => {
+    const edgeKey = makeEdgeKey(indexA, indexB)
+    if (!edgeEndpoints.has(edgeKey)) {
+      edgeEndpoints.set(edgeKey, [indexA, indexB])
+    }
+
+    const opposites = edgeOpposites.get(edgeKey)
+    if (opposites) {
+      opposites.push(oppositeIndex)
+      return
+    }
+
+    edgeOpposites.set(edgeKey, [oppositeIndex])
+  }
+
+  for (const [indexA, indexB, indexC] of topology.triangles) {
+    registerEdge(indexA, indexB, indexC)
+    registerEdge(indexB, indexC, indexA)
+    registerEdge(indexC, indexA, indexB)
+  }
+
+  for (const [edgeKey, [indexA, indexB]] of edgeEndpoints) {
+    const oppositeCount = edgeOpposites.get(edgeKey)?.length ?? 0
+    if (topology.creaseEdges.has(edgeKey) || oppositeCount <= 1) {
+      creaseNeighbors[indexA].add(indexB)
+      creaseNeighbors[indexB].add(indexA)
+    }
+  }
+
+  const nextVertexStencils = new Array<VertexStencil>(vertexCount)
+  const nextCreaseVertices = Array.from({ length: vertexCount }, (_, index) =>
+    topology.creaseVertices[index] || creaseNeighbors[index].size > 0,
+  )
+
+  for (let index = 0; index < vertexCount; index += 1) {
+    const vertexStencil = topology.vertexStencils[index]
+    const sharpNeighbors = [...creaseNeighbors[index]]
+
+    if (sharpNeighbors.length === 2) {
+      nextVertexStencils[index] = combineVertexStencils([
+        { stencil: vertexStencil, weight: 0.75 },
+        { stencil: topology.vertexStencils[sharpNeighbors[0]], weight: 0.125 },
+        { stencil: topology.vertexStencils[sharpNeighbors[1]], weight: 0.125 },
+      ])
+      continue
+    }
+
+    if (sharpNeighbors.length > 2) {
+      const sharedWeight = 0.25 / sharpNeighbors.length
+      nextVertexStencils[index] = combineVertexStencils([
+        { stencil: vertexStencil, weight: 0.75 },
+        ...sharpNeighbors.map((neighborIndex) => ({
+          stencil: topology.vertexStencils[neighborIndex],
+          weight: sharedWeight,
+        })),
+      ])
+      continue
+    }
+
+    const neighbors = adjacency[index]
+    if (neighbors.length === 0) {
+      nextVertexStencils[index] = cloneVertexStencil(vertexStencil)
+      continue
+    }
+
+    const valence = neighbors.length
+    const beta = valence === 3 ? 3 / 16 : 3 / (8 * valence)
+    nextVertexStencils[index] = combineVertexStencils([
+      { stencil: vertexStencil, weight: 1 - valence * beta },
+      ...neighbors.map((neighborIndex) => ({
+        stencil: topology.vertexStencils[neighborIndex],
+        weight: beta,
+      })),
+    ])
+  }
+
+  const edgeVertexIndices = new Map<string, number>()
+  const nextCreaseEdges = new Set<string>()
+  const orderedEdges = [...edgeEndpoints.entries()].sort(([edgeKeyA], [edgeKeyB]) =>
+    edgeKeyA.localeCompare(edgeKeyB),
+  )
+
+  for (const [edgeKey, [indexA, indexB]] of orderedEdges) {
+    const opposites = edgeOpposites.get(edgeKey) ?? []
+    const isSharpEdge = topology.creaseEdges.has(edgeKey) || opposites.length <= 1
+
+    const oddStencil = isSharpEdge || opposites.length < 2
+      ? combineVertexStencils([
+          { stencil: topology.vertexStencils[indexA], weight: 0.5 },
+          { stencil: topology.vertexStencils[indexB], weight: 0.5 },
+        ])
+      : combineVertexStencils([
+          { stencil: topology.vertexStencils[indexA], weight: 3 / 8 },
+          { stencil: topology.vertexStencils[indexB], weight: 3 / 8 },
+          { stencil: topology.vertexStencils[opposites[0]], weight: 1 / 8 },
+          { stencil: topology.vertexStencils[opposites[1]], weight: 1 / 8 },
+        ])
+
+    const edgeVertexIndex = nextVertexStencils.length
+    nextVertexStencils.push(oddStencil)
+    nextCreaseVertices.push(isSharpEdge)
+    edgeVertexIndices.set(edgeKey, edgeVertexIndex)
+
+    if (isSharpEdge) {
+      nextCreaseEdges.add(makeEdgeKey(indexA, edgeVertexIndex))
+      nextCreaseEdges.add(makeEdgeKey(edgeVertexIndex, indexB))
+    }
+  }
+
+  const nextTriangles: TriangleIndices[] = []
+  for (const [indexA, indexB, indexC] of topology.triangles) {
+    const edgeAB = edgeVertexIndices.get(makeEdgeKey(indexA, indexB))
+    const edgeBC = edgeVertexIndices.get(makeEdgeKey(indexB, indexC))
+    const edgeCA = edgeVertexIndices.get(makeEdgeKey(indexC, indexA))
+
+    if (
+      edgeAB === undefined ||
+      edgeBC === undefined ||
+      edgeCA === undefined
+    ) {
+      throw new Error('Failed to build subdivided render topology.')
+    }
+
+    nextTriangles.push(
+      [indexA, edgeAB, edgeCA],
+      [edgeAB, indexB, edgeBC],
+      [edgeCA, edgeBC, indexC],
+      [edgeAB, edgeBC, edgeCA],
+    )
+  }
+
+  return {
+    vertexStencils: nextVertexStencils,
+    triangles: nextTriangles,
+    indices: nextTriangles.flat(),
+    wireEdgePairs: buildWireEdgePairs(nextTriangles),
+    creaseVertices: nextCreaseVertices,
+    creaseEdges: nextCreaseEdges,
+  }
 }

@@ -90,6 +90,7 @@ app.innerHTML = `
         </button>
       </div>
       <div class="ui-body panel-sections">
+        <div class="control-hint">Wheel = Zoom, MMB = Pan, RMB = Orbit</div>
         <section class="panel-section">
           <button class="panel-section-header" type="button" aria-expanded="true">
             <span class="panel-section-label">Simulation</span>
@@ -106,6 +107,13 @@ app.innerHTML = `
               </div>
               <input id="pressureSlider" type="range" min="0" max="1" value="0.42" step="0.01" />
             </label>
+            <label class="control" for="subdivisionSlider">
+              <div class="control-row">
+                <span>Subdivision</span>
+                <span id="subdivision-value">1</span>
+              </div>
+              <input id="subdivisionSlider" type="range" min="0" max="2" value="1" step="1" />
+            </label>
           </div>
         </section>
         <section class="panel-section">
@@ -113,6 +121,14 @@ app.innerHTML = `
             <span class="panel-section-label">Seams</span>
           </button>
           <div class="panel-section-content panel-controls-stack">
+            <div class="control-hint seam-hints">
+              LMB = Draw Seam<br />
+              Enter = Finish Seam<br />
+              Connect to Start = Finish Seam<br />
+              LMB+Drag on Corner = Move Corner<br />
+              LMB Closed Shape = Inner Seam Mode<br />
+              LMB Inflated = Push Mesh
+            </div>
             <label class="control" for="outerSeamCurvature">
               <div class="control-row">
                 <span>Outer Seam Curvature</span>
@@ -287,6 +303,8 @@ const innerSeamCurvatureSlider = requireElement<HTMLInputElement>('#innerSeamCur
 const innerSeamCurvatureValue = requireElement<HTMLSpanElement>('#inner-seam-curvature-value')
 const pressureSlider = requireElement<HTMLInputElement>('#pressureSlider')
 const pressureValue = requireElement<HTMLSpanElement>('#pressure-value')
+const subdivisionSlider = requireElement<HTMLInputElement>('#subdivisionSlider')
+const subdivisionValue = requireElement<HTMLSpanElement>('#subdivision-value')
 const seamCurvesToggle = requireElement<HTMLInputElement>('#seamCurvesToggle')
 const baseGridToggle = requireElement<HTMLInputElement>('#baseGridToggle')
 const wireToggle = requireElement<HTMLInputElement>('#wireToggle')
@@ -452,6 +470,11 @@ let draggingPanel = false
 let handleDragHistoryRecorded = false
 let outerSeamCurvature = Math.max(1, Math.round(Number.parseFloat(outerSeamCurvatureSlider.value) || 1))
 let innerSeamCurvature = Math.max(1, Math.round(Number.parseFloat(innerSeamCurvatureSlider.value) || 1))
+let subdivisionLevel = THREE.MathUtils.clamp(
+  Math.round(Number.parseFloat(subdivisionSlider.value) || 1),
+  0,
+  2,
+)
 
 const CLICK_DRAG_THRESHOLD = 6
 const INTERNAL_SNAP_DISTANCE = 0.32
@@ -724,6 +747,7 @@ function rebuildInflatedSimulations(): void {
       })),
       outerSeamCurvature,
       innerSeamCurvature,
+      subdivisionLevel,
     )
     simulation.setWireframeVisible(showWireframe)
     simulation.setReflectionEnabled(reflectionsEnabled)
@@ -1470,6 +1494,7 @@ function toggleInflation(): void {
         })),
         outerSeamCurvature,
         innerSeamCurvature,
+        subdivisionLevel,
       )
       simulation.setWireframeVisible(showWireframe)
       simulation.setReflectionEnabled(reflectionsEnabled)
@@ -1613,6 +1638,22 @@ innerSeamCurvatureSlider.addEventListener('input', () => {
 pressureSlider.addEventListener('input', () => {
   pressureValue.textContent = getPressureValue().toFixed(2)
   refreshOutlineState()
+})
+
+subdivisionSlider.addEventListener('input', () => {
+  const nextLevel = THREE.MathUtils.clamp(
+    Math.round(Number.parseFloat(subdivisionSlider.value) || 1),
+    0,
+    2,
+  )
+  subdivisionLevel = nextLevel
+  subdivisionSlider.value = `${nextLevel}`
+  subdivisionValue.textContent = `${nextLevel}`
+  updateRangeProgress(subdivisionSlider)
+
+  for (const simulation of pillowSimulations) {
+    simulation.setSubdivisionLevel(subdivisionLevel)
+  }
 })
 
 seamCurvesToggle.addEventListener('change', () => {
@@ -2058,8 +2099,10 @@ onResize()
 bindSectionCollapses()
 outerSeamCurvatureValue.textContent = `${outerSeamCurvature}`
 innerSeamCurvatureValue.textContent = `${innerSeamCurvature}`
+subdivisionValue.textContent = `${subdivisionLevel}`
 updateRangeProgress(outerSeamCurvatureSlider)
 updateRangeProgress(innerSeamCurvatureSlider)
+updateRangeProgress(subdivisionSlider)
 applyDisplayVisibilityState()
 applyReflectionState()
 requestAnimationFrame(() => {

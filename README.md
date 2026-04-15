@@ -14,6 +14,7 @@
 - Closed-outline validation with self-intersection rejection
 - Pressure-driven pillow inflation and deflation across all closed seams
 - Adaptive, more uniform pillow triangulation
+- Subdivision slider for render-side Loop subdivision plus Laplacian smoothing
 - Custom paired-sheet mass-spring simulation with rounded inflation profiling
 - Toggleable mesh wire overlay for previewing the triangle layout
 - Toggleable Foil Material mode with reflective balloon shading and shared iridescence across foil and matte looks
@@ -56,10 +57,12 @@ npm run build
 - `Outer Seam Curvature`: round and subdivide the outer seam path used for preview and inflation
 - `Inner Seam Curvature`: round and subdivide chamber seam paths used for preview and inflation
 - `Pressure Slider`: raise or lower the inflation target
+- `Subdivision`: refine the displayed pillow mesh with Loop subdivision and Laplacian smoothing
 - `Seam Curves`: show or hide the seam and draft seam overlays
 - `Base Grid`: show or hide the DifferentialLayers-style ground grid
 - `Mesh Wires`: show or hide the triangle wire overlay
 - `Foil Material`: toggle between reflective foil shading and the softer matte look
+- `Left Click` on an inflated pillow: push the mesh and release it for rebound and ripple
 - `Export OBJ` / `Export GLB` / `Export Screenshot`: save the current pillow geometry or viewport image
 - `Reset`: return to the editable flat outlines, or clear all drafts if no pillow exists
 - `Right Drag`: orbit the camera
